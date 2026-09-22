@@ -13,3 +13,7 @@ logs
 
 # Generated quality report
 /data/quality_report.json
+
+# Local generation progress
+/.generation-status.json
+/.generation-status.json.tmp

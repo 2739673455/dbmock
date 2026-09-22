@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from time import perf_counter
+
 import logging
 
 from sqlalchemy import text
@@ -18,10 +20,11 @@ def materialize_period(
     batch_id: str,
 ) -> int:
     """在 Doris 内按月集合计算库存日快照"""
+    started = perf_counter()
     parameters = {
         "period_start": period.start_date,
         "period_end": period.end_date,
-        "as_of_time": ctx.as_of_time,
+        "as_of_time": ctx.validation_cutoff or ctx.as_of_time,
         "batch_id": batch_id,
     }
     with ctx.engine.connect() as conn:
@@ -38,7 +41,14 @@ def materialize_period(
                 parameters,
             ).scalar_one()
         )
-    logger.info("库存日快照批量生成完成 period=%s rows=%s", period.key, count)
+    logger.info(
+        "month=%s 库存快照写入完成 start=%s end=%s rows=%s elapsed=%.2fs",
+        period.key,
+        period.start_date,
+        period.end_date,
+        count,
+        perf_counter() - started,
+    )
     return count
 
 

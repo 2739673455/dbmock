@@ -5,19 +5,18 @@ from __future__ import annotations
 import hashlib
 import json
 import warnings
+from functools import lru_cache
 from collections import defaultdict
 from collections.abc import Iterable, Iterator, Mapping
-from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from sqlalchemy import MetaData, Table, select, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import SAWarning
 
-from .database import DorisStreamLoader
 
 UNKNOWN_SK = -1
 UNKNOWN_ID = 0
@@ -184,22 +183,6 @@ def assert_empty(
         raise ValueError(f"目标库不是空库，请先执行 make init-db: {names}")
 
 
-def load_rows(
-    conn: Connection,
-    table: Table,
-    *,
-    where: Any | None = None,
-    order_by: Iterable[Any] = (),
-) -> list[dict[str, Any]]:
-    stmt = select(table)
-    if where is not None:
-        stmt = stmt.where(where)
-    order_columns = list(order_by)
-    if order_columns:
-        stmt = stmt.order_by(*order_columns)
-    return [dict(row) for row in conn.execute(stmt).mappings()]
-
-
 def build_version_index(
     rows: Iterable[Mapping[str, Any]], business_key: str
 ) -> dict[Any, list[dict[str, Any]]]:
@@ -220,29 +203,36 @@ def version_at(
     raise ValueError(f"维度版本未命中: business_id={business_id}, time={event_time}")
 
 
+class RowLoader(Protocol):
+    def load(self, table_name: str, rows: Iterable[Mapping[str, Any]], /) -> None: ...
+
+
+@lru_cache(maxsize=256)
+def _audit_time_fields(columns: tuple[str, ...]) -> tuple[str, ...]:
+    """按实际行结构缓存时间字段，兼顾同表可选列不同的情况。"""
+    return tuple(field for field in AUDIT_TIME_FIELDS if field in columns)
+
+
 class TableWriter:
     """按表缓冲并批量写入"""
 
     def __init__(
         self,
-        loader: DorisStreamLoader,
+        loader: RowLoader,
         batch_size: int,
-        load_workers: int,
         start_date: date,
         as_of_time: datetime,
     ) -> None:
         self.loader = loader
         self.batch_size = batch_size
-        self.load_workers = load_workers
         self.start_time = start_of_day(start_date)
         self.as_of_time = as_of_time
         self.buffers: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        self.counts: dict[str, int] = defaultdict(int)
 
     def _business_time(self, row: Mapping[str, Any]) -> datetime:
         candidates = []
-        for field in AUDIT_TIME_FIELDS:
-            value = row.get(field)
+        for field in _audit_time_fields(tuple(row)):
+            value = row[field]
             if isinstance(value, datetime):
                 candidates.append(value)
             elif isinstance(value, date):
@@ -262,9 +252,7 @@ class TableWriter:
             return row
         business_time = self._business_time(row)
         audit_key = str(
-            row.get("source_record_id")
-            or row.get("attribute_hash")
-            or stable_hash(row)
+            row.get("source_record_id") or row.get("attribute_hash") or stable_hash(row)
         )
         digest = int(hashlib.sha256(audit_key.encode()).hexdigest()[:8], 16)
         if "snapshot_time" in row:
@@ -304,31 +292,8 @@ class TableWriter:
             groups[tuple(sorted(row))].append(row)
         for group in groups.values():
             self.loader.load(table_name, group)
-        self.counts[table_name] += len(rows)
         rows.clear()
 
-    def flush_all(self) -> dict[str, int]:
-        table_names = [name for name, rows in self.buffers.items() if rows]
-        if not table_names:
-            return dict(self.counts)
-        with ThreadPoolExecutor(
-            max_workers=min(self.load_workers, len(table_names)),
-            thread_name_prefix="doris-stream-load",
-        ) as executor:
-            futures = {
-                table_name: executor.submit(self._load_buffer, table_name)
-                for table_name in table_names
-            }
-            for table_name, future in futures.items():
-                future.result()
-                self.counts[table_name] += len(self.buffers[table_name])
-                self.buffers[table_name].clear()
-        return dict(self.counts)
-
-    def _load_buffer(self, table_name: str) -> None:
-        rows = self.buffers[table_name]
-        groups: dict[tuple[str, ...], list[dict[str, Any]]] = defaultdict(list)
-        for row in rows:
-            groups[tuple(sorted(row))].append(row)
-        for group in groups.values():
-            self.loader.load(table_name, group)
+    def flush_all(self) -> None:
+        for table_name in self.buffers:
+            self.flush(table_name)

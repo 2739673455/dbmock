@@ -8,11 +8,10 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Table
+from ..plan_store import PlanStore
 
 from ..reference import (
     ReferenceData,
-    listing_date_for_spu,
     warning_stock_qty_for_sku,
 )
 from ..settings import RunContext
@@ -25,9 +24,9 @@ from ..support import (
     dimension_audit,
     fact_audit,
     iter_jsonl_rows,
-    load_rows,
     start_of_day,
 )
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,34 +51,31 @@ def _scd(
     )
 
 
-def _spu_rows(ctx: RunContext):
-    yield _scd(
-        {
-            "spu_sk": UNKNOWN_SK,
-            "spu_id": UNKNOWN_ID,
-            "spu_name": "未知SPU",
-            "spu_sub_title": None,
-            "category_id": UNKNOWN_ID,
-            "brand_id": UNKNOWN_ID,
-            "shop_id": UNKNOWN_ID,
-            "is_virtual": 0,
-            "is_presale": None,
-            "presale_start_time": None,
-            "presale_end_time": None,
-            "weight_kg": None,
-            "volume_m3": None,
-            "on_shelf_time": None,
-            "spu_status": "在售",
-            "is_deleted": 0,
-        },
-        ctx,
-        datetime(1900, 1, 1),
-    )
-    count = 0
-    for index, source in enumerate(iter_jsonl_rows(ctx.gen.data_dir / "spus.jsonl")):
-        if count >= ctx.gen.spu_count:
-            break
-        listing_date = listing_date_for_spu(ctx, index, int(source["spu_id"]))
+def _spu_rows(ctx: RunContext, selections: list[tuple[dict, date]], first: bool):
+    if first:
+        yield _scd(
+            {
+                "spu_sk": UNKNOWN_SK,
+                "spu_id": UNKNOWN_ID,
+                "spu_name": "未知SPU",
+                "spu_sub_title": None,
+                "category_id": UNKNOWN_ID,
+                "brand_id": UNKNOWN_ID,
+                "shop_id": UNKNOWN_ID,
+                "is_virtual": 0,
+                "is_presale": None,
+                "presale_start_time": None,
+                "presale_end_time": None,
+                "weight_kg": None,
+                "volume_m3": None,
+                "on_shelf_time": None,
+                "spu_status": "在售",
+                "is_deleted": 0,
+            },
+            ctx,
+            datetime(1900, 1, 1),
+        )
+    for source, listing_date in selections:
         listing_time = start_of_day(listing_date)
         yield _scd(
             {
@@ -106,33 +102,29 @@ def _spu_rows(ctx: RunContext):
             ctx,
             listing_time,
         )
-        count += 1
-    if count != ctx.gen.spu_count:
-        raise ValueError(
-            f"真实目录 SPU 不足 requested={ctx.gen.spu_count} available={count}"
+
+
+def _sku_rows(ctx: RunContext, spus: list[dict[str, Any]], first: bool):
+    if first:
+        yield _scd(
+            {
+                "sku_sk": UNKNOWN_SK,
+                "sku_id": UNKNOWN_ID,
+                "sku_name": "未知SKU",
+                "spu_id": UNKNOWN_ID,
+                "shop_id": UNKNOWN_ID,
+                "category_id": UNKNOWN_ID,
+                "brand_id": UNKNOWN_ID,
+                "bar_code": None,
+                "sku_specs_json": {"未知": "未知"},
+                "unit": None,
+                "warning_stock_qty": 0,
+                "sku_status": "在售",
+                "is_deleted": 0,
+            },
+            ctx,
+            datetime(1900, 1, 1),
         )
-
-
-def _sku_rows(ctx: RunContext, spus: list[dict[str, Any]]):
-    yield _scd(
-        {
-            "sku_sk": UNKNOWN_SK,
-            "sku_id": UNKNOWN_ID,
-            "sku_name": "未知SKU",
-            "spu_id": UNKNOWN_ID,
-            "shop_id": UNKNOWN_ID,
-            "category_id": UNKNOWN_ID,
-            "brand_id": UNKNOWN_ID,
-            "bar_code": None,
-            "sku_specs_json": {"未知": "未知"},
-            "unit": None,
-            "warning_stock_qty": 0,
-            "sku_status": "在售",
-            "is_deleted": 0,
-        },
-        ctx,
-        datetime(1900, 1, 1),
-    )
     spu_by_id = {int(row["spu_id"]): row for row in spus}
     counts: Counter[int] = Counter()
     for source in iter_jsonl_rows(ctx.gen.data_dir / "skus.jsonl"):
@@ -151,9 +143,7 @@ def _sku_rows(ctx: RunContext, spus: list[dict[str, Any]]):
                 "bar_code": source.get("bar_code"),
                 "sku_specs_json": source.get("sku_specs_json"),
                 "unit": source.get("unit"),
-                "warning_stock_qty": warning_stock_qty_for_sku(
-                    int(source["sku_id"])
-                ),
+                "warning_stock_qty": warning_stock_qty_for_sku(int(source["sku_id"])),
                 "sku_status": str(source.get("sku_status", "在售")),
                 "is_deleted": 0,
             },
@@ -166,26 +156,59 @@ def _sku_rows(ctx: RunContext, spus: list[dict[str, Any]]):
         raise ValueError(f"存在没有真实 SKU 的 SPU: {invalid[:10]}")
 
 
-def run_dimensions(ctx: RunContext, tables: dict[str, Table]) -> None:
-    with ctx.engine.connect() as conn:
-        writer = TableWriter(
-            ctx.loader,
-            ctx.gen.batch_size,
-            ctx.gen.stream_load_workers,
-            ctx.gen.start_date,
-            ctx.as_of_time,
+def run_dimensions(ctx: RunContext, store: PlanStore) -> list[dict]:
+    import random
+
+    used = {row["spu_id"] for row in store.rows("dim_spu_info_zip")}
+    first = not used
+    needed = ctx.gen.initial_spu_count + ctx.gen.spu_count
+    selections = []
+    for source in iter_jsonl_rows(ctx.gen.data_dir / "spus.jsonl"):
+        if len(selections) >= needed:
+            break
+        if source["spu_id"] in used:
+            continue
+        rng = random.Random(
+            f"{ctx.gen.seed}:{ctx.gen.start_date}:listing:{source['spu_id']}"
         )
-        writer.add_many("dim_spu_info_zip", _spu_rows(ctx))
-        writer.flush_all()
-        spus = load_rows(
-            conn,
-            tables["dim_spu_info_zip"],
-            where=(tables["dim_spu_info_zip"].c.is_current == 1)
-            & (tables["dim_spu_info_zip"].c.spu_id != UNKNOWN_ID),
+        offset = (
+            0
+            if len(selections) < ctx.gen.initial_spu_count
+            else rng.randrange((ctx.gen.end_date - ctx.gen.start_date).days + 1)
         )
-        writer.add_many("dim_sku_info_zip", _sku_rows(ctx, spus))
-        counts = writer.flush_all()
-    logger.info("商品维度初始化完成 %s", counts)
+        selections.append((source, ctx.gen.start_date + timedelta(days=offset)))
+    if len(selections) < needed:
+        logger.warning(
+            "month=%s 种子商品不足或已耗尽 requested=%s available=%s",
+            ctx.gen.start_date.strftime("%Y-%m"),
+            needed,
+            len(selections),
+        )
+    if first and not selections:
+        raise ValueError("种子中没有可用商品")
+    writer = TableWriter(
+        store, ctx.gen.batch_size, ctx.gen.dataset_start, ctx.data_end_time
+    )
+    writer.add_many("dim_spu_info_zip", _spu_rows(ctx, selections, first))
+    writer.flush_all()
+    selected_ids = {source["spu_id"] for source, _ in selections}
+    spus = [
+        row for row in store.rows("dim_spu_info_zip") if row["spu_id"] in selected_ids
+    ]
+    writer.add_many("dim_sku_info_zip", _sku_rows(ctx, spus, first))
+    writer.flush_all()
+    return [
+        {
+            "spu_id": row["spu_id"],
+            "listing_time": row["on_shelf_time"],
+            "sku_ids": [
+                sku["sku_id"]
+                for sku in store.rows("dim_sku_info_zip")
+                if sku["spu_id"] == row["spu_id"]
+            ],
+        }
+        for row in spus
+    ]
 
 
 def generate_price_events(
@@ -215,9 +238,7 @@ def generate_price_events(
                 "shop_id": profile.shop["shop_id"],
                 "category_sk": profile.category["category_sk"],
                 "category_id": profile.category["category_id"],
-                "brand_sk": profile.brand["brand_sk"]
-                if profile.brand
-                else UNKNOWN_SK,
+                "brand_sk": profile.brand["brand_sk"] if profile.brand else UNKNOWN_SK,
                 "brand_id": profile.brand["brand_id"] if profile.brand else None,
                 "previous_list_price": previous.list_price if previous else None,
                 "previous_sale_price": previous.sale_price if previous else None,

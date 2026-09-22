@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import logging
+from time import perf_counter
 import random
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from faker import Faker
-from sqlalchemy import Table
+from ..plan_store import PlanStore
 
 from ..support import (
     END_OF_TIME,
@@ -605,10 +606,12 @@ def _warehouse_rows(ctx: RunContext, regions: list[dict[str, Any]]):
         yield _scd(row, ctx, start_of_day(ctx.gen.start_date))
 
 
-def _user_rows(ctx: RunContext, region_codes: list[dict[str, Any]]):
+def _user_rows(
+    ctx: RunContext, region_codes: list[dict[str, Any]], first_id: int, initial: bool
+):
     fake = Faker("zh_CN")
-    fake.seed_instance(ctx.gen.seed)
-    rng = random.Random(f"{ctx.gen.seed}:users")
+    fake.seed_instance(f"{ctx.gen.seed}:{ctx.gen.start_date}:users:{initial}")
+    rng = random.Random(f"{ctx.gen.seed}:{ctx.gen.start_date}:users:{initial}")
     start_time = start_of_day(ctx.gen.start_date)
     total_seconds = max(
         1,
@@ -621,40 +624,41 @@ def _user_rows(ctx: RunContext, region_codes: list[dict[str, Any]]):
     active_channels = ["APP", "H5", "PC", "MINI_PROGRAM", "SEM"]
     channel_weights = [40, 23, 14, 18, 5]
 
-    yield _scd(
-        {
-            "user_sk": UNKNOWN_SK,
-            "user_id": UNKNOWN_ID,
-            "user_name": "未知用户",
-            "nick_name": "未知用户",
-            "gender": "未知",
-            "birthday": None,
-            "phone": None,
-            "email": None,
-            "register_time": None,
-            "register_channel_code": None,
-            "register_source": None,
-            "user_level": "0",
-            "is_vip": 0,
-            "province_code": None,
-            "city_code": None,
-            "district_code": None,
-            "occupation": None,
-            "income_level": None,
-            "education_level": None,
-            "marital_status": None,
-            "user_status": "正常",
-            "is_deleted": 0,
-        },
-        ctx,
-        datetime(1900, 1, 1),
-    )
+    if initial:
+        yield _scd(
+            {
+                "user_sk": UNKNOWN_SK,
+                "user_id": UNKNOWN_ID,
+                "user_name": "未知用户",
+                "nick_name": "未知用户",
+                "gender": "未知",
+                "birthday": None,
+                "phone": None,
+                "email": None,
+                "register_time": None,
+                "register_channel_code": None,
+                "register_source": None,
+                "user_level": "0",
+                "is_vip": 0,
+                "province_code": None,
+                "city_code": None,
+                "district_code": None,
+                "occupation": None,
+                "income_level": None,
+                "education_level": None,
+                "marital_status": None,
+                "user_status": "正常",
+                "is_deleted": 0,
+            },
+            ctx,
+            datetime(1900, 1, 1),
+        )
 
-    for idx in range(ctx.gen.user_count):
-        user_id = 1_000_001 + idx
+    for idx in range(ctx.gen.initial_user_count if initial else ctx.gen.user_count):
+        user_id = first_id + idx
         region = region_codes[rng.randrange(len(region_codes))]
         name = fake.name()
-        is_legacy = rng.random() < 0.45
+        is_legacy = initial
         if is_legacy:
             register_time = start_time - timedelta(
                 days=rng.randint(30, 365 * 5),
@@ -670,7 +674,9 @@ def _user_rows(ctx: RunContext, region_codes: list[dict[str, Any]]):
             weights=channel_weights,
             k=1,
         )[0]
-        age = min(68, max(18, int(rng.gauss(34 if register_channel != "PC" else 40, 10))))
+        age = min(
+            68, max(18, int(rng.gauss(34 if register_channel != "PC" else 40, 10)))
+        )
         birthday = register_time.date().replace(
             year=register_time.year - age,
             day=min(register_time.day, 28),
@@ -752,7 +758,7 @@ def _tag_relation_rows(
         rng = random.Random(f"{ctx.gen.seed}:tags:{user_id}")
         register_time = user.get("register_time") or start_of_day(ctx.gen.start_date)
         candidates = ["ACTIVE_USER"]
-        tenure_days = max(0, (ctx.gen.end_date - register_time.date()).days)
+        tenure_days = max(0, (ctx.gen.start_date - register_time.date()).days)
         if tenure_days <= 90:
             candidates.append("NEW_USER")
         if str(user.get("income_level")) in {"3k以下", "3k-8k"}:
@@ -765,7 +771,9 @@ def _tag_relation_rows(
         if tenure_days > 365 and rng.random() < 0.16:
             candidates.append("DORMANT_USER")
         rng.shuffle(candidates)
-        selected_codes = list(dict.fromkeys(candidates))[: rng.randint(1, min(4, len(candidates)))]
+        selected_codes = list(dict.fromkeys(candidates))[
+            : rng.randint(1, min(4, len(candidates)))
+        ]
         for code in selected_codes:
             tag = tag_by_code[code]
             yield {
@@ -825,10 +833,7 @@ def generate_user_lifecycle_updates(
             target_status = "流失"
         elif inactive_days >= 60:
             target_status = "沉默"
-        elif (
-            str(current["user_status"]) in {"沉默", "流失"}
-            and sessions_30d > 0
-        ):
+        elif str(current["user_status"]) in {"沉默", "流失"} and sessions_30d > 0:
             target_status = "召回"
         target_vip = int(target_level >= 3 or spend_amount >= 3_000)
         if (
@@ -945,10 +950,7 @@ def generate_user_lifecycle_updates(
         refresh_codes = {
             code
             for code in desired_codes & set(current_by_code)
-            if abs(
-                float(current_by_code[code]["tag_score"])
-                - desired_scores[code]
-            )
+            if abs(float(current_by_code[code]["tag_score"]) - desired_scores[code])
             >= 0.05
         }
         for code, relation in current_by_code.items():
@@ -969,7 +971,7 @@ def generate_user_lifecycle_updates(
                 },
             )
             tag_change_count += 1
-        for code in (desired_codes - set(current_by_code)) | refresh_codes:
+        for code in sorted((desired_codes - set(current_by_code)) | refresh_codes):
             tag = refs.tags_by_code[code]
             writer.add(
                 "bridge_user_tag_relation_zip",
@@ -996,57 +998,52 @@ def generate_user_lifecycle_updates(
     return changed_count + tag_change_count
 
 
-def run(ctx: RunContext, tables: dict[str, Table]) -> None:
-    with ctx.engine.connect() as conn:
-        writer = TableWriter(
-            ctx.loader,
-            ctx.gen.batch_size,
-            ctx.gen.stream_load_workers,
-            ctx.gen.start_date,
-            ctx.as_of_time,
-        )
-        writer.add_many("dim_date", _date_rows(ctx))
+def run(ctx: RunContext, store: PlanStore) -> None:
+    started = perf_counter()
+    writer = TableWriter(
+        store, ctx.gen.batch_size, ctx.gen.dataset_start, ctx.data_end_time
+    )
+    first = not store.rows("dim_channel_info")
+    writer.add_many("dim_date", _date_rows(ctx))
+    if first:
         writer.add_many("dim_channel_info", _channel_rows(ctx))
         writer.add_many("dim_page_info", _page_rows(ctx))
         writer.add_many("dim_geo_region_zip", _geo_rows(ctx))
         writer.add_many("dim_brand_info", _brand_rows(ctx))
         writer.add_many("dim_payment_type", _payment_rows(ctx))
         writer.add_many("dim_logistics_company", _logistics_rows(ctx))
-        seller_rows, shop_rows = _seller_and_shop_rows(ctx)
-        writer.add_many("dim_seller_info_zip", seller_rows)
-        writer.add_many("dim_shop_info_zip", shop_rows)
+        sellers, shops = _seller_and_shop_rows(ctx)
+        writer.add_many("dim_seller_info_zip", sellers)
+        writer.add_many("dim_shop_info_zip", shops)
         writer.add_many("dim_category_info_zip", _category_rows(ctx))
-        writer.flush_all()
-
-        geo_regions = load_json_rows(ctx.gen.master_data_path("geo_regions.json"))
-        writer.add_many("dim_warehouse_info_zip", _warehouse_rows(ctx, geo_regions))
-        district_regions = [
-            row
-            for row in geo_regions
-            if int(row["region_level"]) >= 3
-        ]
-        writer.add_many("dim_user_info_zip", _user_rows(ctx, district_regions))
         writer.add_many("dim_user_tag_info", _tag_rows(ctx))
-        writer.flush_all()
-
-        users = [
-            dict(row)
-            for row in conn.execute(
-                tables["dim_user_info_zip"]
-                .select()
-                .where(
-                    tables["dim_user_info_zip"].c.is_current == 1,
-                    tables["dim_user_info_zip"].c.user_id != UNKNOWN_ID,
-                )
-            ).mappings()
-        ]
-        tags = [
-            dict(row)
-            for row in conn.execute(tables["dim_user_tag_info"].select()).mappings()
-        ]
-        writer.add_many(
-            "bridge_user_tag_relation_zip",
-            _tag_relation_rows(ctx, users, tags),
-        )
-        counts = writer.flush_all()
-    logger.info("公共维度生成完成 %s", counts)
+    geo_regions = load_json_rows(ctx.gen.master_data_path("geo_regions.json"))
+    if first:
+        writer.add_many("dim_warehouse_info_zip", _warehouse_rows(ctx, geo_regions))
+    writer.flush_all()
+    regions = [row for row in geo_regions if int(row["region_level"]) >= 3]
+    previous_ids = {int(row["user_id"]) for row in store.rows("dim_user_info_zip")}
+    first_id = max(previous_ids | {1_000_000}) + 1
+    if first:
+        writer.add_many("dim_user_info_zip", _user_rows(ctx, regions, first_id, True))
+        first_id += ctx.gen.initial_user_count
+    writer.add_many("dim_user_info_zip", _user_rows(ctx, regions, first_id, False))
+    writer.flush_all()
+    users = [
+        row
+        for row in store.rows("dim_user_info_zip")
+        if row["user_id"] != UNKNOWN_ID and row["user_id"] not in previous_ids
+    ]
+    writer.add_many(
+        "bridge_user_tag_relation_zip",
+        _tag_relation_rows(ctx, users, store.rows("dim_user_tag_info")),
+    )
+    writer.flush_all()
+    logger.info(
+        "month=%s 用户数据生成完成 planned_users=%s initial_users=%s new_users=%s elapsed=%.2fs",
+        ctx.gen.start_date.strftime("%Y-%m"),
+        len(users),
+        ctx.gen.initial_user_count,
+        ctx.gen.user_count,
+        perf_counter() - started,
+    )

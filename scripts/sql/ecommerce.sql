@@ -1422,3 +1422,21 @@ DISTRIBUTED BY HASH (`snapshot_date_key`) BUCKETS AUTO
 PROPERTIES (
     'replication_num' = '1'
 );
+
+-- 生成器内部状态，独立于 45 张业务表。
+-- 同一文档的所有分块由单次 Stream Load 原子提交。
+CREATE TABLE dbmock_documents (
+    document_key VARCHAR(128) NOT NULL,
+    chunk_no INT NOT NULL,
+    chunk_count INT NOT NULL,
+    revision VARCHAR(32) NOT NULL,
+    digest VARCHAR(64) NOT NULL,
+    payload STRING NOT NULL
+)
+ENGINE = OLAP
+UNIQUE KEY (document_key, chunk_no)
+DISTRIBUTED BY HASH (document_key) BUCKETS 1
+PROPERTIES (
+    'replication_num' = '1',
+    'enable_unique_key_merge_on_write' = 'true'
+);

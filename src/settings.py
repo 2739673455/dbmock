@@ -1,15 +1,18 @@
-"""数据生成配置"""
+"""按月生成配置、可复现规模抽样和运行上下文。"""
 
 from __future__ import annotations
 
-import hashlib
-import json
+import calendar
+import math
 import os
 import random
+import re
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 import dotenv
 from sqlalchemy import URL, Engine, create_engine
@@ -18,25 +21,49 @@ if TYPE_CHECKING:
     from .database import DorisStreamLoader
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-ENV_FILE = ROOT_DIR / ".env"
+DATA_DIR = ROOT_DIR / "data"
+# 规模为正态分布均值；smoke 使用相同日期范围，抽样结果缩放到 5%。
+# variation 可用同名规模项覆盖 default；0 表示固定规模。
+GENERATION_CONFIG = {
+    "scale": {
+        "initial_users": 6000,  # 起始月份月初已有用户数，仅首次生成
+        "new_users": 1000,  # 每月新注册用户数
+        "initial_spus": 1000,  # 初始上架 SPU 数，包含关联 SKU，仅首次生成
+        "new_spus": 150,  # 每月新增上架 SPU 数，受剩余种子商品数量限制
+        "order_details": 5000,  # 每月订单明细行数，不是订单数
+        "page_views": 200000,  # 每月页面访问事件数
+        "searches": 30000,  # 每月搜索事件数
+        "promotions": 2,  # 每月新增促销规则数
+        "coupons": 4,  # 每月新增优惠券模板数，不是领取数量
+        "warehouses": 12,  # 初始仓库数，仅首次生成，后续沿用
+    },
+    "variation": {"default": 0.15},  # 默认标准差为规模基准值的 15%
+    "runtime": {
+        "batch_size": 250000,  # 每批写入的行数上限，不参与随机抽样
+        "stream_load_workers": 4,  # Stream Load 并发线程数，不参与随机抽样
+    },
+}
+SEED = 42
 BUSINESS_TIMEZONE = timezone(timedelta(hours=8), "Asia/Shanghai")
-dotenv.load_dotenv(ENV_FILE)
+dotenv.load_dotenv(ROOT_DIR / ".env")
 
 
-def _now() -> datetime:
+def now() -> datetime:
     return datetime.now(tz=BUSINESS_TIMEZONE).replace(tzinfo=None)
 
 
-def _today() -> date:
-    return _now().date()
+def parse_month(value: str) -> date:
+    if not re.fullmatch(r"\d{4}-\d{2}", value):
+        raise ValueError("月份格式必须为 YYYY-MM")
+    return date.fromisoformat(value + "-01")
 
 
-def _two_years_ago() -> date:
-    today = _today()
-    try:
-        return today.replace(year=today.year - 2)
-    except ValueError:
-        return today.replace(year=today.year - 2, day=28)
+def month_end(month: date) -> date:
+    return month.replace(day=calendar.monthrange(month.year, month.month)[1])
+
+
+def next_month(month: date) -> date:
+    return month_end(month) + timedelta(days=1)
 
 
 @dataclass(slots=True)
@@ -51,7 +78,7 @@ class DorisConfig:
     @property
     def sqlalchemy_url(self) -> URL:
         return URL.create(
-            drivername="mysql+pymysql",
+            "mysql+pymysql",
             username=self.user,
             password=self.password,
             host=self.host,
@@ -60,162 +87,140 @@ class DorisConfig:
         )
 
 
+POSITIVE_SCALES = {
+    "initial_users",
+    "new_users",
+    "initial_spus",
+    "warehouses",
+    "order_details",
+    "page_views",
+    "searches",
+}
+
+
+def read_config() -> dict:
+    """复制当前生成配置，避免月度快照共享可变对象。"""
+    return deepcopy(GENERATION_CONFIG)
+
+
+def sample_scales(
+    config: dict, month: date, smoke: bool, initial: dict[str, int] | None = None
+) -> dict[str, int]:
+    result = {}
+    for name in sorted(config["scale"]):
+        if initial is not None and name in {
+            "initial_users",
+            "initial_spus",
+            "warehouses",
+        }:
+            result[name] = initial[name]
+            continue
+        mean = config["scale"][name]
+        ratio = config["variation"].get(name, config["variation"].get("default", 0.15))
+        sigma = mean * ratio
+        rng = random.Random(f"{SEED}:{month:%Y-%m}:{name}")
+        value = float(mean)
+        if sigma:
+            while True:
+                value = rng.gauss(mean, sigma)
+                if mean - 3 * sigma <= value <= mean + 3 * sigma:
+                    break
+        normal = max(1 if name in POSITIVE_SCALES else 0, math.floor(value + 0.5))
+        # 先抽正常规模再缩放；离散且必须存在的对象至少保留一个。
+        result[name] = (
+            max(1 if normal else 0, math.floor(normal * 0.05 + 0.5))
+            if smoke
+            else normal
+        )
+    if result["page_views"] < max(result["order_details"] * 8, result["searches"] * 3):
+        raise ValueError("访问量不足：月度访问量须至少为订单明细的 8 倍、搜索量的 3 倍")
+    return result
+
+
 @dataclass(slots=True)
 class GenerateConfig:
-    start_date: date = field(default_factory=_two_years_ago)
-    end_date: date = field(default_factory=_today)
-    batch_size: int = 250_000
-    stream_load_workers: int = 4
-    seed: int = 42
-    user_count: int = 30_000
-    spu_count: int = 5_000
-    promotion_count: int = 50
-    coupon_count: int = 100
-    order_detail_count: int = 100_000
-    page_view_count: int = 4_000_000
-    search_count: int = 600_000
-    warehouse_count: int = 12
-    data_dir: Path = field(default_factory=lambda: ROOT_DIR / "data")
+    start_date: date
+    end_date: date
+    dataset_start: date
+    batch_size: int
+    stream_load_workers: int
+    user_count: int
+    initial_user_count: int
+    spu_count: int
+    initial_spu_count: int
+    promotion_count: int
+    coupon_count: int
+    order_detail_count: int
+    page_view_count: int
+    search_count: int
+    warehouse_count: int
     is_smoke: bool = False
+    data_dir: Path = field(default_factory=lambda: DATA_DIR)
+    seed: int = field(default=SEED, init=False)
 
     def master_data_path(self, filename: str) -> Path:
         return self.data_dir / filename
 
     @classmethod
-    def smoke(cls) -> GenerateConfig:
-        end_date = _today()
+    def from_plan(
+        cls, month: date, start: date, config: dict, scales: dict, smoke: bool
+    ) -> GenerateConfig:
+        first = month == start
         return cls(
-            start_date=end_date - timedelta(days=6),
-            end_date=end_date,
-            batch_size=50_000,
-            user_count=20,
-            spu_count=8,
-            promotion_count=3,
-            coupon_count=3,
-            order_detail_count=60,
-            page_view_count=2_000,
-            search_count=300,
-            warehouse_count=3,
-            is_smoke=True,
+            month,
+            month_end(month),
+            start,
+            **config["runtime"],
+            user_count=scales["new_users"],
+            initial_user_count=scales["initial_users"] if first else 0,
+            spu_count=scales["new_spus"],
+            initial_spu_count=scales["initial_spus"] if first else 0,
+            promotion_count=scales["promotions"],
+            coupon_count=scales["coupons"],
+            order_detail_count=scales["order_details"],
+            page_view_count=scales["page_views"],
+            search_count=scales["searches"],
+            warehouse_count=scales["warehouses"],
+            is_smoke=smoke,
         )
-
-    def validate(self) -> None:
-        if self.start_date > self.end_date:
-            raise ValueError("开始日期不能晚于结束日期")
-        if self.end_date > _today():
-            raise ValueError("结束日期不能晚于任务执行日期")
-        positive_values = {
-            "batch_size": self.batch_size,
-            "stream_load_workers": self.stream_load_workers,
-            "user_count": self.user_count,
-            "spu_count": self.spu_count,
-            "promotion_count": self.promotion_count,
-            "coupon_count": self.coupon_count,
-            "order_detail_count": self.order_detail_count,
-            "page_view_count": self.page_view_count,
-            "search_count": self.search_count,
-            "warehouse_count": self.warehouse_count,
-        }
-        invalid = [name for name, value in positive_values.items() if value <= 0]
-        if invalid:
-            raise ValueError(f"以下配置必须大于 0: {', '.join(invalid)}")
-        if self.order_detail_count < 20:
-            raise ValueError("order_detail_count 不能小于 20")
-        required_files = (
-            "manifest.json",
-            "brands.json",
-            "categories.json",
-            "geo_regions.json",
-            "logistics_companies.json",
-            "payment_types.json",
-            "shops.json",
-            "spus.jsonl",
-            "skus.jsonl",
-            "lineage.jsonl",
-        )
-        missing = [
-            filename
-            for filename in required_files
-            if not (self.data_dir / filename).exists()
-        ]
-        if missing:
-            raise ValueError(
-                "data 目录不完整，请执行 uv run python -m collection: "
-                + ", ".join(missing)
-            )
-        manifest = json.loads(
-            (self.data_dir / "manifest.json").read_text(encoding="utf-8")
-        )
-        catalog_spu_count = int(manifest.get("counts", {}).get("spus", 0))
-        if catalog_spu_count < self.spu_count:
-            raise ValueError(
-                f"商品目录 SPU 数量不足 required={self.spu_count} "
-                f"actual={catalog_spu_count}"
-            )
 
 
 @dataclass(slots=True)
 class RunContext:
     db: DorisConfig
-    gen: GenerateConfig
-    as_of_time: datetime = field(default_factory=_now)
+    gen: GenerateConfig = field(init=False)
+    as_of_time: datetime = field(default_factory=now)
     execution_id: str = field(init=False)
-    run_id: str = field(init=False)
     engine: Engine = field(init=False)
     loader: DorisStreamLoader = field(init=False)
-    rng: random.Random = field(init=False)
+    expected_counts: dict[str, int] = field(default_factory=dict)
+    validation_cutoff: datetime | None = None
 
     def __post_init__(self) -> None:
         from .database import DorisStreamLoader
 
-        self.gen.validate()
-        execution_stamp = self.as_of_time.strftime("%Y%m%d%H%M%S%f")
-        manifest = json.loads(
-            (self.gen.data_dir / "manifest.json").read_text(encoding="utf-8")
-        )
-        catalog_hash = str(
-            manifest.get("source", {}).get("origins", [{}])[0].get("sha256", "")
-        )
-        config_payload = {
-            "seed": self.gen.seed,
-            "user_count": self.gen.user_count,
-            "spu_count": self.gen.spu_count,
-            "promotion_count": self.gen.promotion_count,
-            "coupon_count": self.gen.coupon_count,
-            "order_detail_count": self.gen.order_detail_count,
-            "page_view_count": self.gen.page_view_count,
-            "search_count": self.gen.search_count,
-            "warehouse_count": self.gen.warehouse_count,
-            "is_smoke": self.gen.is_smoke,
-        }
-        config_hash = hashlib.sha256(
-            json.dumps(config_payload, sort_keys=True).encode()
-        ).hexdigest()
-        self.execution_id = f"dbmock-exec-{execution_stamp}"
-        self.run_id = (
-            f"dbmock-{self.gen.start_date:%Y%m%d}-{self.gen.end_date:%Y%m%d}"
-            f"-{catalog_hash[:12]}-{config_hash[:12]}"
-        )
+        self.execution_id = f"dbmock-exec-{uuid4().hex}"
         self.engine = create_engine(
-            self.db.sqlalchemy_url,
-            isolation_level="AUTOCOMMIT",
-            pool_pre_ping=True,
+            self.db.sqlalchemy_url, isolation_level="AUTOCOMMIT", pool_pre_ping=True
         )
         self.loader = DorisStreamLoader(self.db, self.execution_id)
-        self.rng = random.Random(self.gen.seed)
+
+    @property
+    def run_id(self) -> str:
+        return f"dbmock-{self.gen.dataset_start:%Y%m}-" + (
+            "smoke" if self.gen.is_smoke else "full"
+        )
 
     @property
     def initial_batch_id(self) -> str:
-        return f"{self.run_id}-INIT"
+        return f"{self.run_id}-{self.gen.start_date:%Y-%m}-INIT"
 
     def period_batch_id(self, period_key: str) -> str:
         return f"{self.run_id}-{period_key}"
 
     @property
     def data_end_time(self) -> datetime:
-        """本次构建允许的最大业务时间"""
-        configured_end = datetime.combine(self.gen.end_date, time.max)
-        return min(configured_end, self.as_of_time)
+        return datetime.combine(self.gen.end_date, time.max)
 
     def close(self) -> None:
         self.loader.close()

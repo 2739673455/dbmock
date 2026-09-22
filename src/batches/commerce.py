@@ -192,9 +192,7 @@ def _build_order_plans(
     for intent in intents:
         primary = refs.profile_by_sku[int(intent.primary_sku_id)]
         warehouse_id = int(refs.warehouse_for_profile(primary)["warehouse_id"])
-        shop_profiles = active_by_shop[
-            (warehouse_id, int(primary.shop["shop_id"]))
-        ]
+        shop_profiles = active_by_shop[(warehouse_id, int(primary.shop["shop_id"]))]
         if len(shop_profiles) < intent.line_count:
             eligible_shops = [
                 profiles
@@ -202,15 +200,11 @@ def _build_order_plans(
                 if len(profiles) >= intent.line_count
             ]
             if not eligible_shops:
-                raise ValueError(
-                    f"{day} 没有可承载 {intent.line_count} 个订单行的店铺"
-                )
+                raise ValueError(f"{day} 没有可承载 {intent.line_count} 个订单行的店铺")
             shop_profiles = eligible_shops[
                 int(intent.user["user_id"]) % len(eligible_shops)
             ]
-            primary = shop_profiles[
-                int(intent.primary_sku_id) % len(shop_profiles)
-            ]
+            primary = shop_profiles[int(intent.primary_sku_id) % len(shop_profiles)]
         lines = [OrderLinePlan(primary, max(1, min(3, intent.cart_quantity)))]
         used = {int(primary.sku["sku_id"])}
         while len(lines) < intent.line_count:
@@ -238,7 +232,6 @@ def _inventory_opening_events(
             on_hand=0,
             reserved=0,
             in_transit=0,
-            unit_cost=profile.price_on(day).cost_price,
         )
         events.append(
             _inventory_event(
@@ -311,9 +304,7 @@ def _replenishment_events(
         position = state.inventory[sku_id]
         projected_available = position.available + due_delta[sku_id]
         projected_supply = (
-            projected_available
-            + position.in_transit
-            + due_transit_delta[sku_id]
+            projected_available + position.in_transit + due_transit_delta[sku_id]
         )
         target = required + profile.warning_stock_qty
         if projected_supply >= target:
@@ -424,8 +415,7 @@ def _write_order(
     insufficient_lines = [
         line
         for line in plan.lines
-        if state.inventory[int(line.profile.sku["sku_id"])].available
-        < line.quantity
+        if state.inventory[int(line.profile.sku["sku_id"])].available < line.quantity
     ]
     has_stock = not insufficient_lines
 
@@ -472,9 +462,7 @@ def _write_order(
             "spu_id": profile.spu["spu_id"],
             "category_sk": profile.category["category_sk"],
             "category_id": profile.category["category_id"],
-            "brand_sk": profile.brand["brand_sk"]
-            if profile.brand
-            else UNKNOWN_SK,
+            "brand_sk": profile.brand["brand_sk"] if profile.brand else UNKNOWN_SK,
             "brand_id": profile.brand["brand_id"] if profile.brand else None,
             "receiver_region_sk": intent.region["region_sk"]
             if intent.region
@@ -583,7 +571,6 @@ def _write_order(
             cart_key = (int(user["user_id"]), int(profile.sku["sku_id"]))
             state.cart_positions[cart_key] = CartPosition(
                 line.quantity,
-                cart_time,
             )
 
     for line in plan.lines:
@@ -593,7 +580,6 @@ def _write_order(
             state.cart_positions.pop(cart_key, None)
         else:
             position.quantity -= line.quantity
-            position.updated_at = intent.order_time
 
     _write_order_status(
         state,
@@ -692,9 +678,7 @@ def _write_order(
     successful_payment_detail_id: int | None = None
     for attempt_no, (attempt_payment, failure_reason) in enumerate(attempts, start=1):
         retry_delay = (
-            _bounded_lognormal(rng, 5.15, 0.70, 45, 1_800)
-            if attempt_no > 1
-            else 0
+            _bounded_lognormal(rng, 5.15, 0.70, 45, 1_800) if attempt_no > 1 else 0
         )
         attempt_time = pay_time + timedelta(seconds=retry_delay)
         pay_result_time = attempt_time + timedelta(
@@ -960,11 +944,20 @@ def _choose_payment(
     channel_code = str(channel["channel_code"])
     base_weights = {
         "APP": {"ALIPAY": 38, "WECHAT": 38, "UNIONPAY": 8, "HUABEI": 15, "COD": 1},
-        "MINI_PROGRAM": {"ALIPAY": 14, "WECHAT": 70, "UNIONPAY": 7, "HUABEI": 8, "COD": 1},
+        "MINI_PROGRAM": {
+            "ALIPAY": 14,
+            "WECHAT": 70,
+            "UNIONPAY": 7,
+            "HUABEI": 8,
+            "COD": 1,
+        },
         "H5": {"ALIPAY": 42, "WECHAT": 38, "UNIONPAY": 9, "HUABEI": 10, "COD": 1},
         "PC": {"ALIPAY": 48, "WECHAT": 20, "UNIONPAY": 23, "HUABEI": 7, "COD": 2},
         "SEM": {"ALIPAY": 40, "WECHAT": 39, "UNIONPAY": 10, "HUABEI": 10, "COD": 1},
-    }.get(channel_code, {"ALIPAY": 40, "WECHAT": 40, "UNIONPAY": 12, "HUABEI": 7, "COD": 1})
+    }.get(
+        channel_code,
+        {"ALIPAY": 40, "WECHAT": 40, "UNIONPAY": 12, "HUABEI": 7, "COD": 1},
+    )
     birthday = user.get("birthday")
     age = 35
     if birthday is not None:
@@ -2039,7 +2032,6 @@ def _apply_inventory_events(
         position.on_hand = after_on_hand
         position.reserved = after_reserved
         position.in_transit = after_in_transit
-        position.unit_cost = price(event["unit_cost"])
         event_day = event["event_time"].date()
         sequence = state.inventory_event_sequences.get(event_day, 0) + 1
         state.inventory_event_sequences[event_day] = sequence
@@ -2267,8 +2259,7 @@ def _eligible_promotion(
             for row in refs.active_promotions(moment)
             if refs.promotion_applies(int(row["promotion_id"]), profile)
             and (
-                row.get("threshold_amount") is None
-                or amount >= row["threshold_amount"]
+                row.get("threshold_amount") is None or amount >= row["threshold_amount"]
             )
         ),
         None,
@@ -2290,8 +2281,7 @@ def _eligible_coupon(
             for row in refs.active_coupons(moment)
             if refs.coupon_applies(int(row["coupon_template_id"]), profile)
             and (
-                row.get("threshold_amount") is None
-                or amount >= row["threshold_amount"]
+                row.get("threshold_amount") is None or amount >= row["threshold_amount"]
             )
         ),
         None,

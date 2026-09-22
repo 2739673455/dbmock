@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import Table
+from ..plan_store import PlanStore
 
 from ..settings import RunContext
 from ..support import (
@@ -14,7 +14,6 @@ from ..support import (
     UNKNOWN_ID,
     UNKNOWN_SK,
     TableWriter,
-    load_rows,
     stable_hash,
     start_of_day,
 )
@@ -45,9 +44,7 @@ def _campaign_window(
         anchor.replace(month=12, day=12),
     )
     valid_specials = [
-        day
-        for day in special_days
-        if ctx.gen.start_date <= day <= ctx.gen.end_date
+        day for day in special_days if ctx.gen.start_date <= day <= ctx.gen.end_date
     ]
     if index % 4 == 0 and valid_specials:
         anchor = min(valid_specials, key=lambda day: abs((day - anchor).days))
@@ -58,7 +55,7 @@ def _campaign_window(
     else:
         raise ValueError(f"不支持的营销规则类型: {rule_kind}")
     start = start_of_day(max(ctx.gen.start_date, anchor - timedelta(days=1)))
-    end_date = min(ctx.gen.end_date + timedelta(days=1), anchor + timedelta(days=duration))
+    end_date = anchor + timedelta(days=duration)
     return start, start_of_day(end_date)
 
 
@@ -97,7 +94,7 @@ def _promotion_rows(ctx: RunContext):
         threshold = Decimal((index % 6 + 1) * 50)
         discount = Decimal((index % 5 + 1) * 10)
         rule = {
-            "promotion_id": 30_000_001 + index,
+            "promotion_id": ctx.gen.start_date.toordinal() * 100_000 + index + 1,
             "rule_version_no": 1,
             "promotion_name": f"平台{promotion_type}活动{index + 1:03d}",
             "promotion_type": promotion_type,
@@ -110,9 +107,7 @@ def _promotion_rows(ctx: RunContext):
             "rule_description": f"满 {threshold} 元享活动优惠",
             "threshold_amount": threshold,
             "discount_amount": discount if promotion_type != "折扣" else None,
-            "discount_rate": Decimal("0.880000")
-            if promotion_type == "折扣"
-            else None,
+            "discount_rate": Decimal("0.880000") if promotion_type == "折扣" else None,
             "max_discount_amount": Decimal("100.00")
             if promotion_type == "折扣"
             else None,
@@ -160,7 +155,7 @@ def _coupon_rows(ctx: RunContext):
         threshold = Decimal((index % 6 + 1) * 50)
         discount = Decimal((index % 4 + 1) * 10)
         rule = {
-            "coupon_template_id": 40_000_001 + index,
+            "coupon_template_id": ctx.gen.start_date.toordinal() * 100_000 + index + 1,
             "rule_version_no": 1,
             "coupon_name": f"限时{'折扣' if is_discount else '满减'}券{index + 1:03d}",
             "coupon_type": "折扣券" if is_discount else "满减券",
@@ -181,72 +176,64 @@ def _coupon_rows(ctx: RunContext):
         yield rule | _rule_audit(rule, ctx)
 
 
-def run(ctx: RunContext, tables: dict[str, Table]) -> None:
-    with ctx.engine.connect() as conn:
-        writer = TableWriter(
-            ctx.loader,
-            ctx.gen.batch_size,
-            ctx.gen.stream_load_workers,
-            ctx.gen.start_date,
-            ctx.as_of_time,
-        )
-        writer.add_many("dim_promotion_rule_version", _promotion_rows(ctx))
-        writer.add_many("dim_coupon_template_version", _coupon_rows(ctx))
-        writer.flush_all()
-        promotions = load_rows(
-            conn,
-            tables["dim_promotion_rule_version"],
-            where=tables["dim_promotion_rule_version"].c.promotion_id != UNKNOWN_ID,
-        )
-        coupons = load_rows(
-            conn,
-            tables["dim_coupon_template_version"],
-            where=tables["dim_coupon_template_version"].c.coupon_template_id
-            != UNKNOWN_ID,
-        )
-        categories = load_rows(
-            conn,
-            tables["dim_category_info_zip"],
-            where=(tables["dim_category_info_zip"].c.is_current == 1)
-            & (tables["dim_category_info_zip"].c.is_leaf == 1)
-            & (tables["dim_category_info_zip"].c.category_id != UNKNOWN_ID),
-        )
-        shops = load_rows(
-            conn,
-            tables["dim_shop_info_zip"],
-            where=(tables["dim_shop_info_zip"].c.is_current == 1)
-            & (tables["dim_shop_info_zip"].c.shop_id != UNKNOWN_ID),
-        )
-        for index, promotion in enumerate(promotions):
+def run(ctx: RunContext, store: PlanStore) -> None:
+    writer = TableWriter(
+        store, ctx.gen.batch_size, ctx.gen.dataset_start, ctx.data_end_time
+    )
+    first = not store.rows("dim_promotion_rule_version")
+    for row in _promotion_rows(ctx):
+        if first or row["promotion_id"] != UNKNOWN_ID:
+            writer.add("dim_promotion_rule_version", row)
+    for row in _coupon_rows(ctx):
+        if first or row["coupon_template_id"] != UNKNOWN_ID:
+            writer.add("dim_coupon_template_version", row)
+    writer.flush_all()
+    categories = [
+        row
+        for row in store.rows("dim_category_info_zip")
+        if row["is_current"] and row["is_leaf"] and row["category_id"] != UNKNOWN_ID
+    ]
+    shops = [
+        row
+        for row in store.rows("dim_shop_info_zip")
+        if row["is_current"] and row["shop_id"] != UNKNOWN_ID
+    ]
+    for kind, parent, scope_table, id_key, sk_key in (
+        (
+            "promotion",
+            "dim_promotion_rule_version",
+            "bridge_promotion_scope",
+            "promotion_id",
+            "promotion_version_sk",
+        ),
+        (
+            "coupon",
+            "dim_coupon_template_version",
+            "bridge_coupon_scope",
+            "coupon_template_id",
+            "coupon_template_version_sk",
+        ),
+    ):
+        rules = [
+            row
+            for row in store.rows(parent)
+            if row[id_key] != UNKNOWN_ID
+            and row["load_batch_id"] == ctx.initial_batch_id
+        ]
+        for index, rule in enumerate(rules):
             scope_type, business_id = _scope(index, categories, shops)
             writer.add(
-                "bridge_promotion_scope",
+                scope_table,
                 {
-                    "promotion_version_sk": promotion["promotion_version_sk"],
-                    "promotion_id": promotion["promotion_id"],
+                    sk_key: rule[sk_key],
+                    id_key: rule[id_key],
                     "scope_type": scope_type,
                     "scope_business_id": business_id,
                     "is_excluded": 0,
                     "load_batch_id": ctx.initial_batch_id,
                 },
             )
-        for index, coupon in enumerate(coupons):
-            scope_type, business_id = _scope(index, categories, shops)
-            writer.add(
-                "bridge_coupon_scope",
-                {
-                    "coupon_template_version_sk": coupon[
-                        "coupon_template_version_sk"
-                    ],
-                    "coupon_template_id": coupon["coupon_template_id"],
-                    "scope_type": scope_type,
-                    "scope_business_id": business_id,
-                    "is_excluded": 0,
-                    "load_batch_id": ctx.initial_batch_id,
-                },
-            )
-        counts = writer.flush_all()
-    logger.info("营销规则初始化完成 %s", counts)
+    writer.flush_all()
 
 
 def _scope(

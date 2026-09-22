@@ -41,9 +41,7 @@ def generate_day(
     for active_profile in active_profiles:
         shop_id = int(active_profile.shop["shop_id"])
         active_shop_counts[shop_id] = active_shop_counts.get(shop_id, 0) + 1
-        warehouse_id = int(
-            refs.warehouse_for_profile(active_profile)["warehouse_id"]
-        )
+        warehouse_id = int(refs.warehouse_for_profile(active_profile)["warehouse_id"])
         fulfillment_key = (warehouse_id, shop_id)
         fulfillment_shop_counts[fulfillment_key] = (
             fulfillment_shop_counts.get(fulfillment_key, 0) + 1
@@ -61,9 +59,7 @@ def generate_day(
         list,
     ] = {}
     for active_profile in active_profiles:
-        warehouse_id = int(
-            refs.warehouse_for_profile(active_profile)["warehouse_id"]
-        )
+        warehouse_id = int(refs.warehouse_for_profile(active_profile)["warehouse_id"])
         shop_id = int(active_profile.shop["shop_id"])
         maximum_lines = min(
             3,
@@ -99,8 +95,7 @@ def generate_day(
         rng,
     )
     minimum_views = {
-        index: 5 if index in conversion_indexes else 3
-        for index in cart_indexes
+        index: 5 if index in conversion_indexes else 3 for index in cart_indexes
     }
     view_counts = _session_lengths(
         page_view_count,
@@ -134,9 +129,7 @@ def generate_day(
             _long_tail_index(rng, len(day_active_users), 1.45)
         ]
         maximum_second = int(
-            (
-                day_cutoff - datetime.combine(day, datetime.min.time())
-            ).total_seconds()
+            (day_cutoff - datetime.combine(day, datetime.min.time())).total_seconds()
         )
         session_start = datetime.combine(day, datetime.min.time())
         user = (
@@ -157,17 +150,13 @@ def generate_day(
         required_lines = line_count_by_session.get(session_index, 1)
         eligible_profiles = eligible_profiles_by_lines[required_lines]
         if is_conversion:
-            service_warehouse_id = int(
-                refs.service_warehouse(region)["warehouse_id"]
-            )
+            service_warehouse_id = int(refs.service_warehouse(region)["warehouse_id"])
             eligible_profiles = eligible_profiles_by_fulfillment.get(
                 (service_warehouse_id, required_lines),
                 [],
             )
         if not eligible_profiles:
-            raise ValueError(
-                f"{day} 没有可承载 {required_lines} 个订单行的商品"
-            )
+            raise ValueError(f"{day} 没有可承载 {required_lines} 个订单行的商品")
         profile = _choose_profile(eligible_profiles, day, rng)
         pages = _page_sequence(
             refs,
@@ -331,23 +320,15 @@ def generate_day(
                     "session_id": session_id,
                     "page_sk": page["page_sk"],
                     "page_id": page["page_id"],
-                    "last_page_sk": last_page["page_sk"]
-                    if last_page
-                    else UNKNOWN_SK,
+                    "last_page_sk": last_page["page_sk"] if last_page else UNKNOWN_SK,
                     "last_page_id": last_page["page_id"] if last_page else None,
                     "channel_sk": channel["channel_sk"],
                     "channel_code": channel["channel_code"],
-                    "shop_sk": profile.shop["shop_sk"]
-                    if product_page
-                    else UNKNOWN_SK,
+                    "shop_sk": profile.shop["shop_sk"] if product_page else UNKNOWN_SK,
                     "shop_id": profile.shop["shop_id"] if product_page else None,
-                    "sku_sk": profile.sku["sku_sk"]
-                    if product_page
-                    else UNKNOWN_SK,
+                    "sku_sk": profile.sku["sku_sk"] if product_page else UNKNOWN_SK,
                     "sku_id": profile.sku["sku_id"] if product_page else None,
-                    "spu_sk": profile.spu["spu_sk"]
-                    if product_page
-                    else UNKNOWN_SK,
+                    "spu_sk": profile.spu["spu_sk"] if product_page else UNKNOWN_SK,
                     "spu_id": profile.spu["spu_id"] if product_page else None,
                     "category_sk": profile.category["category_sk"]
                     if product_page
@@ -358,9 +339,7 @@ def generate_day(
                     "promotion_version_sk": promotion["promotion_version_sk"]
                     if promotion
                     else UNKNOWN_SK,
-                    "promotion_id": promotion["promotion_id"]
-                    if promotion
-                    else None,
+                    "promotion_id": promotion["promotion_id"] if promotion else None,
                     "search_detail_id": search_ids[-1] if search_ids else None,
                     "business_type": None,
                     "business_id": None,
@@ -409,7 +388,7 @@ def generate_day(
                 price_point.sale_price,
                 cart_time,
             )
-            state.cart_positions[cart_key] = CartPosition(cart_quantity, cart_time)
+            state.cart_positions[cart_key] = CartPosition(cart_quantity)
             cart_local += 1
             if not is_conversion and rng.random() < 0.18:
                 mutation_time = min(
@@ -450,7 +429,6 @@ def generate_day(
                 if after_quantity:
                     state.cart_positions[cart_key] = CartPosition(
                         after_quantity,
-                        mutation_time,
                     )
                 else:
                     state.cart_positions.pop(cart_key, None)
@@ -464,8 +442,6 @@ def generate_day(
             conversion_intents.append(
                 ConversionIntent(
                     order_time=order_time,
-                    session_start_time=session_start,
-                    session_end_time=session_end,
                     session_id=session_id,
                     device_id=device_id,
                     user=user,
@@ -486,7 +462,7 @@ def generate_day(
             favorite_profile = profile
             cancel_favorite = bool(favorites) and rng.random() < 0.16
             if cancel_favorite:
-                favorite_sku_id = rng.choice(tuple(favorites))
+                favorite_sku_id = rng.choice(sorted(favorites))
                 favorite_profile = refs.profile_by_sku[favorite_sku_id]
                 favorites.remove(favorite_sku_id)
             else:
@@ -776,7 +752,10 @@ def _page_sequence(
         "HOME": (["CATEGORY", "SEARCH", "PRODUCT", "SHOP"], [28, 31, 34, 7]),
         "CATEGORY": (["CATEGORY", "SEARCH", "PRODUCT", "HOME"], [18, 16, 58, 8]),
         "SEARCH": (["SEARCH", "PRODUCT", "CATEGORY", "HOME"], [18, 62, 12, 8]),
-        "PRODUCT": (["PRODUCT", "SHOP", "SEARCH", "CATEGORY", "HOME"], [48, 14, 16, 14, 8]),
+        "PRODUCT": (
+            ["PRODUCT", "SHOP", "SEARCH", "CATEGORY", "HOME"],
+            [48, 14, 16, 14, 8],
+        ),
         "SHOP": (["PRODUCT", "SHOP", "SEARCH", "HOME"], [57, 18, 15, 10]),
     }
     while len(page_ids) < count:

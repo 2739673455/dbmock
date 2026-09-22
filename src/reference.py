@@ -10,14 +10,13 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Table
+from .plan_store import PlanStore
 
 from .settings import RunContext
 from .support import (
     UNKNOWN_ID,
     build_version_index,
     iter_jsonl_rows,
-    load_rows,
     price,
 )
 
@@ -60,14 +59,13 @@ class ReferenceData:
     user_registration_times: list[datetime]
     tags_by_code: dict[str, dict[str, Any]]
     user_tag_relations: dict[int, list[dict[str, Any]]]
-    shops: list[dict[str, Any]]
-    shop_by_id: dict[int, dict[str, Any]]
     sellers_by_id: dict[int, dict[str, Any]]
     channels: list[dict[str, Any]]
     pages_by_id: dict[str, dict[str, Any]]
     payments: list[dict[str, Any]]
     logistics: list[dict[str, Any]]
     warehouses: list[dict[str, Any]]
+    warehouse_by_sku: dict[int, dict[str, Any]]
     regions_by_district: dict[str, dict[str, Any]]
     promotions: list[dict[str, Any]]
     coupons: list[dict[str, Any]]
@@ -89,10 +87,7 @@ class ReferenceData:
         self,
         profile: ProductProfile,
     ) -> dict[str, Any]:
-        index = _stable_int(f"sku-warehouse:{profile.sku['sku_id']}") % len(
-            self.warehouses
-        )
-        return self.warehouses[index]
+        return self.warehouse_by_sku[int(profile.sku["sku_id"])]
 
     def service_warehouse(
         self,
@@ -111,10 +106,7 @@ class ReferenceData:
         regional = [
             warehouse
             for warehouse in self.warehouses
-            if _province_service_zone(
-                str(warehouse.get("province_code") or "")
-            )
-            == zone
+            if _province_service_zone(str(warehouse.get("province_code") or "")) == zone
         ]
         candidates = regional or self.warehouses
         index = _stable_int(f"service-warehouse:{province_code or 'unknown'}") % len(
@@ -157,15 +149,6 @@ class ReferenceData:
         )
 
 
-def listing_date_for_spu(ctx: RunContext, index: int, spu_id: int) -> date:
-    span_days = max(1, (ctx.gen.end_date - ctx.gen.start_date).days)
-    if index % 5 == 0:
-        return ctx.gen.start_date
-    latest_offset = max(1, int(span_days * 0.82))
-    offset = _stable_int(f"spu-listing:{spu_id}") % latest_offset
-    return ctx.gen.start_date + timedelta(days=offset)
-
-
 def warning_stock_qty_for_sku(sku_id: int) -> int:
     return 2 + _stable_int(f"warning:{sku_id}") % 8
 
@@ -187,98 +170,36 @@ def _province_service_zone(province_code: str) -> str:
     return "UNKNOWN"
 
 
-def load_reference_data(
-    ctx: RunContext,
-    tables: dict[str, Table],
-) -> ReferenceData:
-    with ctx.engine.connect() as conn:
-        users = load_rows(
-            conn,
-            tables["dim_user_info_zip"],
-            where=tables["dim_user_info_zip"].c.user_id != UNKNOWN_ID,
-        )
-        tags = load_rows(
-            conn,
-            tables["dim_user_tag_info"],
-            where=tables["dim_user_tag_info"].c.tag_code != "UNKNOWN",
-        )
-        tag_relations = load_rows(
-            conn,
-            tables["bridge_user_tag_relation_zip"],
-            where=tables["bridge_user_tag_relation_zip"].c.is_current == 1,
-        )
-        shops = load_rows(
-            conn,
-            tables["dim_shop_info_zip"],
-            where=(tables["dim_shop_info_zip"].c.is_current == 1)
-            & (tables["dim_shop_info_zip"].c.shop_id != UNKNOWN_ID),
-        )
-        sellers = load_rows(
-            conn,
-            tables["dim_seller_info_zip"],
-            where=(tables["dim_seller_info_zip"].c.is_current == 1)
-            & (tables["dim_seller_info_zip"].c.seller_id != UNKNOWN_ID),
-        )
-        skus = load_rows(
-            conn,
-            tables["dim_sku_info_zip"],
-            where=(tables["dim_sku_info_zip"].c.is_current == 1)
-            & (tables["dim_sku_info_zip"].c.sku_id != UNKNOWN_ID),
-        )
-        spus = load_rows(
-            conn,
-            tables["dim_spu_info_zip"],
-            where=(tables["dim_spu_info_zip"].c.is_current == 1)
-            & (tables["dim_spu_info_zip"].c.spu_id != UNKNOWN_ID),
-        )
-        categories = load_rows(
-            conn,
-            tables["dim_category_info_zip"],
-            where=tables["dim_category_info_zip"].c.is_current == 1,
-        )
-        brands = load_rows(conn, tables["dim_brand_info"])
-        channels = load_rows(
-            conn,
-            tables["dim_channel_info"],
-            where=tables["dim_channel_info"].c.channel_code != "UNKNOWN",
-        )
-        pages = load_rows(conn, tables["dim_page_info"])
-        payments = load_rows(
-            conn,
-            tables["dim_payment_type"],
-            where=tables["dim_payment_type"].c.payment_type_code != "UNKNOWN",
-        )
-        logistics = load_rows(
-            conn,
-            tables["dim_logistics_company"],
-            where=tables["dim_logistics_company"].c.logistics_company_id
-            != UNKNOWN_ID,
-        )
-        warehouses = load_rows(
-            conn,
-            tables["dim_warehouse_info_zip"],
-            where=(tables["dim_warehouse_info_zip"].c.is_current == 1)
-            & (tables["dim_warehouse_info_zip"].c.warehouse_id != UNKNOWN_ID),
-        )
-        regions = load_rows(
-            conn,
-            tables["dim_geo_region_zip"],
-            where=(tables["dim_geo_region_zip"].c.is_current == 1)
-            & (tables["dim_geo_region_zip"].c.region_code != "UNKNOWN"),
-        )
-        promotions = load_rows(
-            conn,
-            tables["dim_promotion_rule_version"],
-            where=tables["dim_promotion_rule_version"].c.promotion_id != UNKNOWN_ID,
-        )
-        coupons = load_rows(
-            conn,
-            tables["dim_coupon_template_version"],
-            where=tables["dim_coupon_template_version"].c.coupon_template_id
-            != UNKNOWN_ID,
-        )
-        promotion_scope_rows = load_rows(conn, tables["bridge_promotion_scope"])
-        coupon_scope_rows = load_rows(conn, tables["bridge_coupon_scope"])
+def load_reference_data(ctx: RunContext, store: PlanStore) -> ReferenceData:
+    def active(table, field=None):
+        return [
+            row
+            for row in store.rows(table)
+            if row.get("is_current", 1) == 1
+            and (field is None or row[field] not in (UNKNOWN_ID, "UNKNOWN"))
+        ]
+
+    users = [
+        row for row in store.rows("dim_user_info_zip") if row["user_id"] != UNKNOWN_ID
+    ]
+    tags = active("dim_user_tag_info", "tag_code")
+    tag_relations = active("bridge_user_tag_relation_zip")
+    shops = active("dim_shop_info_zip", "shop_id")
+    sellers = active("dim_seller_info_zip", "seller_id")
+    skus = active("dim_sku_info_zip", "sku_id")
+    spus = active("dim_spu_info_zip", "spu_id")
+    categories = active("dim_category_info_zip")
+    brands = active("dim_brand_info")
+    channels = active("dim_channel_info", "channel_code")
+    pages = active("dim_page_info")
+    payments = active("dim_payment_type", "payment_type_code")
+    logistics = active("dim_logistics_company", "logistics_company_id")
+    warehouses = active("dim_warehouse_info_zip", "warehouse_id")
+    regions = active("dim_geo_region_zip", "region_code")
+    promotions = active("dim_promotion_rule_version", "promotion_id")
+    coupons = active("dim_coupon_template_version", "coupon_template_id")
+    promotion_scope_rows = active("bridge_promotion_scope")
+    coupon_scope_rows = active("bridge_coupon_scope")
 
     spu_by_id = {int(row["spu_id"]): row for row in spus}
     shop_by_id = {int(row["shop_id"]): row for row in shops}
@@ -302,8 +223,7 @@ def load_reference_data(
             _stable_int(f"sku-demand:{profile.sku['sku_id']}") % 1_000_003
             + (_stable_int(f"brand-demand:{profile.sku['brand_id']}") % 1_000_003)
             * 0.18
-            + (_stable_int(f"shop-demand:{profile.sku['shop_id']}") % 1_000_003)
-            * 0.12,
+            + (_stable_int(f"shop-demand:{profile.sku['shop_id']}") % 1_000_003) * 0.12,
             int(profile.sku["sku_id"]),
         )
     )
@@ -343,14 +263,18 @@ def load_reference_data(
         ],
         tags_by_code={str(row["tag_code"]): row for row in tags},
         user_tag_relations=dict(user_tag_relations),
-        shops=shops,
-        shop_by_id=shop_by_id,
         sellers_by_id={int(row["seller_id"]): row for row in sellers},
         channels=channels,
         pages_by_id={str(row["page_id"]): row for row in pages},
         payments=payments,
         logistics=logistics,
         warehouses=warehouses,
+        warehouse_by_sku={
+            int(profile.sku["sku_id"]): warehouses[
+                _stable_int(f"sku-warehouse:{profile.sku['sku_id']}") % len(warehouses)
+            ]
+            for profile in profiles
+        },
         regions_by_district={
             str(row["district_code"]): row
             for row in regions
@@ -391,50 +315,33 @@ def _build_profile(
     current_list = price(source_price.get("origin_list_price_cny") or current_sale)
     margin_basis = 58 + _stable_int(f"margin:{sku_id}") % 23
     cost_ratio = Decimal(margin_basis) / Decimal("100")
-    initial_factor = Decimal(92 + _stable_int(f"initial-price:{sku_id}") % 21) / Decimal(
-        "100"
-    )
-    capture_date = max(
-        listing_date,
-        ctx.gen.end_date
-        - timedelta(days=_stable_int(f"capture-date:{sku_id}") % 21),
-    )
+    initial_factor = Decimal(
+        92 + _stable_int(f"initial-price:{sku_id}") % 21
+    ) / Decimal("100")
+    # 价格轨迹只依赖 SKU 和上市日期，延长生成范围不会改写历史价格。
     dates = [listing_date]
     cursor = listing_date
     while True:
         interval = 75 + _stable_int(f"price-step:{sku_id}:{cursor}") % 91
-        candidate = cursor + timedelta(days=interval)
-        if candidate >= capture_date:
+        cursor += timedelta(days=interval)
+        if cursor > ctx.gen.end_date:
             break
-        dates.append(candidate)
-        cursor = candidate
-    if capture_date not in dates:
-        dates.append(capture_date)
+        dates.append(cursor)
     points: list[PricePoint] = []
-    total_days = max(1, (capture_date - listing_date).days)
     for index, event_date in enumerate(dates):
-        if event_date == capture_date:
-            sale = current_sale
-            list_value = max(current_list, sale)
-            reason_code = "SOURCE_SYNC"
-            description = "同步商品采集基准价格"
-        else:
-            progress = Decimal((event_date - listing_date).days) / Decimal(total_days)
-            base_factor = initial_factor + (Decimal("1") - initial_factor) * progress
-            wave_basis = _stable_int(f"price-wave:{sku_id}:{index}") % 9 - 4
-            wave = Decimal(wave_basis) / Decimal("100")
-            sale = price(current_sale * max(Decimal("0.75"), base_factor + wave))
-            list_value = price(max(sale, current_list * base_factor))
-            reason_code = "INITIAL" if index == 0 else "MARKET_ADJUSTMENT"
-            description = "商品上架定价" if index == 0 else "市场价格周期调整"
+        wave = Decimal(_stable_int(f"price-wave:{sku_id}:{index}") % 9 - 4) / Decimal(
+            "100"
+        )
+        factor = initial_factor if index == 0 else Decimal("1") + wave
+        sale = price(current_sale * factor)
         points.append(
             PricePoint(
                 effective_date=event_date,
-                list_price=list_value,
+                list_price=price(max(sale, current_list * factor)),
                 sale_price=sale,
                 cost_price=price(sale * cost_ratio),
-                reason_code=reason_code,
-                reason_description=description,
+                reason_code="INITIAL" if index == 0 else "MARKET_ADJUSTMENT",
+                reason_description="商品上架定价" if index == 0 else "市场价格周期调整",
             )
         )
     return ProductProfile(
@@ -471,10 +378,7 @@ def _scope_applies(
         business_id = str(scope["scope_business_id"])
         matches = (
             scope_type == "ALL"
-            or (
-                scope_type == "SHOP"
-                and business_id == str(profile.shop["shop_id"])
-            )
+            or (scope_type == "SHOP" and business_id == str(profile.shop["shop_id"]))
             or (
                 scope_type == "CATEGORY"
                 and business_id == str(profile.category["category_id"])

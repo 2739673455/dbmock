@@ -8,30 +8,19 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from .settings import GenerateConfig
 from .support import iter_dates
 
 
 @dataclass(frozen=True, slots=True)
 class MonthPeriod:
-    index: int
     key: str
     start_date: date
     end_date: date
 
 
 @dataclass(frozen=True, slots=True)
-class PeriodTargets:
-    page_views: int
-    searches: int
-    order_details: int
-
-
-@dataclass(frozen=True, slots=True)
 class ConversionIntent:
     order_time: datetime
-    session_start_time: datetime
-    session_end_time: datetime
     session_id: str
     device_id: str
     user: dict[str, Any]
@@ -71,7 +60,6 @@ class SessionJourney:
 @dataclass(slots=True)
 class CartPosition:
     quantity: int
-    updated_at: datetime
 
 
 @dataclass(slots=True)
@@ -79,7 +67,6 @@ class InventoryPosition:
     on_hand: int
     reserved: int
     in_transit: int
-    unit_cost: Decimal
 
     @property
     def available(self) -> int:
@@ -138,7 +125,6 @@ def month_periods(start_date: date, end_date: date) -> list[MonthPeriod]:
         period_end = min(end_date, next_month - timedelta(days=1))
         periods.append(
             MonthPeriod(
-                index=len(periods),
                 key=f"{current:%Y-%m}",
                 start_date=current,
                 end_date=period_end,
@@ -148,56 +134,16 @@ def month_periods(start_date: date, end_date: date) -> list[MonthPeriod]:
     return periods
 
 
-def build_period_targets(
-    config: GenerateConfig,
-    periods: list[MonthPeriod],
-    cutoff: datetime | None = None,
-) -> dict[str, PeriodTargets]:
-    page_weights = [
-        sum(
-            _day_weight(day, config.start_date, "traffic", cutoff)
-            for day in iter_dates(period.start_date, period.end_date)
-        )
-        for period in periods
-    ]
-    search_weights = [
-        sum(
-            _day_weight(day, config.start_date, "search", cutoff)
-            for day in iter_dates(period.start_date, period.end_date)
-        )
-        for period in periods
-    ]
-    order_weights = [
-        sum(
-            _day_weight(day, config.start_date, "order", cutoff)
-            for day in iter_dates(period.start_date, period.end_date)
-        )
-        for period in periods
-    ]
-    page_views = _allocate(config.page_view_count, page_weights)
-    searches = _allocate(config.search_count, search_weights)
-    order_details = _allocate(config.order_detail_count, order_weights)
-    return {
-        period.key: PeriodTargets(
-            page_views=page_views[index],
-            searches=searches[index],
-            order_details=order_details[index],
-        )
-        for index, period in enumerate(periods)
-    }
-
-
 def day_targets(
     total: int,
     period: MonthPeriod,
     start_date: date,
     target_kind: str,
-    cutoff: datetime | None = None,
 ) -> dict[date, int]:
     days = list(iter_dates(period.start_date, period.end_date))
     values = _allocate(
         total,
-        [_day_weight(day, start_date, target_kind, cutoff) for day in days],
+        [_day_weight(day, start_date, target_kind) for day in days],
     )
     return dict(zip(days, values, strict=True))
 
@@ -206,7 +152,6 @@ def _day_weight(
     day: date,
     start_date: date,
     target_kind: str,
-    cutoff: datetime | None = None,
 ) -> float:
     elapsed_years = (day - start_date).days / 365.25
     growth = 1.0 + elapsed_years * 0.12
@@ -242,13 +187,7 @@ def _day_weight(
         )
     elif target_kind != "traffic":
         raise ValueError(f"不支持的日目标类型: {target_kind}")
-    observed_fraction = 1.0
-    if cutoff is not None and day == cutoff.date():
-        elapsed_seconds = (
-            cutoff - datetime.combine(day, datetime.min.time())
-        ).total_seconds()
-        observed_fraction = max(0.02, min(1.0, elapsed_seconds / 86400))
-    return growth * weekday * campaign * behavior_factor * observed_fraction
+    return growth * weekday * campaign * behavior_factor
 
 
 def _allocate(total: int, weights: list[float]) -> list[int]:

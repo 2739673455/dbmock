@@ -95,5 +95,6 @@ if __name__ == "__main__":
         password=os.environ["DB_PASSWORD"],
     )
     db_initializer.delete_db(db_name)
+    (ROOT_DIR / ".generation-status.json").unlink(missing_ok=True)
     db_initializer.create_db(db_name)
     db_initializer.exec_sql_file(db_name, SQL_DIR / "ecommerce.sql")
