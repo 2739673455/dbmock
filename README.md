@@ -17,12 +17,6 @@ git lfs pull
 
 本项目需要可访问的 Apache Doris 服务。使用已有服务时，直接在 `.env` 中填写连接信息。
 
-如果与 [mini-dataagent](https://github.com/2739673455/mini-dataagent) 配合使用，可在 mini-dataagent 仓库根目录启动其提供的 Doris：
-
-```bash
-docker compose -f docker/compose.yml up -d doris-fe doris-be
-```
-
 在 dbmock 仓库根目录安装依赖并创建本地配置（作为子模块使用时先进入 `dbmock/`）：
 
 ```bash
@@ -51,33 +45,14 @@ uv run scripts/init_db.py
 
 该命令会删除并重建 `.env` 中 `DB_NAME` 指定的数据库，然后执行全部业务表 DDL。请勿将其指向需要保留的数据库
 
-### 2. 验证完整链路
-
-```bash
-uv run main.py --smoke
-```
-
-smoke 模式生成最近七天的小规模数据，并执行与全量任务相同的业务链路和质量校验
-
-### 3. 生成两年全量数据
+### 2. 生成两年全量数据
 
 ```bash
 uv run scripts/init_db.py
 uv run main.py
 ```
 
-smoke 数据不能与全量数据共存，因此正式生成前需要重新初始化数据库。生成任务要求全部业务表为空。默认规模在本地 Docker Doris 环境中通常需要十几分钟，实际耗时取决于 CPU、内存、磁盘和 Doris 负载
-
-## 核心能力
-
-- 构建截止任务执行日期、向前覆盖两年的完整业务数据
-- 准备 5,000 个 SPU 及其真实 SKU
-- 按月编排、逐日演化业务状态，支持跨日和跨月业务链路
-- 生成从会话、浏览、搜索、收藏、购物车到订单的用户行为路径
-- 闭合订单、优惠、支付、配送、退款、评价和库存之间的关联关系
-- 使用 SCD2 保存用户、商家、店铺、类目、商品和仓库等维度变化
-- 通过 PyArrow Parquet 和 Doris Stream Load 并发写入大规模数据
-- 对时间顺序、金额分摊、状态流转、外键和数据分布执行自动质量校验
+生成任务要求全部业务表为空。默认规模在本地 Docker Doris 环境中通常需要十分钟左右，实际耗时取决于 CPU、内存、磁盘和 Doris 负载
 
 ## 默认数据集
 
