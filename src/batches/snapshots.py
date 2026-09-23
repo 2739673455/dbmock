@@ -42,10 +42,8 @@ def materialize_period(
             ).scalar_one()
         )
     logger.info(
-        "month=%s 库存快照写入完成 start=%s end=%s rows=%s elapsed=%.2fs",
+        "month=%s 库存快照写入完成 rows=%s elapsed=%.2fs",
         period.key,
-        period.start_date,
-        period.end_date,
         count,
         perf_counter() - started,
     )

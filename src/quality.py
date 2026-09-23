@@ -923,9 +923,8 @@ def validate_database(ctx: RunContext, tables: Mapping[str, Table]) -> None:
         )
     (ctx.gen.data_dir / "quality_report.json").unlink(missing_ok=True)
     logger.info(
-        "month=%s 数据质量校验通过 tables=%s total_rows=%s elapsed=%.2fs",
+        "month=%s 数据质量校验通过 rows=%s elapsed=%.2fs",
         month_label,
-        len(counts),
         sum(counts.values()),
         perf_counter() - started,
     )

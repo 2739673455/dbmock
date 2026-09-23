@@ -13,18 +13,23 @@ git lfs pull
 
 `git lfs install` 通常只需为当前用户执行一次。未正确拉取时，数据文件的内容会是以 `version https://git-lfs.github.com/spec/v1` 开头的 Git LFS 指针；执行 `git lfs pull` 后会替换为实际数据。
 
-### 启动依赖服务
+### 同步 Python 依赖
 
-本项目需要可访问的 Apache Doris 服务。使用已有服务时，直接在 `.env` 中填写连接信息。
-
-在 dbmock 仓库根目录安装依赖并创建本地配置（作为子模块使用时先进入 `dbmock/`）：
+在 dbmock 仓库根目录执行（作为子模块使用时先进入 `dbmock/`）：
 
 ```bash
-cp .env.example .env
 uv sync
 ```
 
-`.env` 保存 Doris 连接信息：
+### 创建本地配置
+
+本项目需要可访问的 Apache Doris 服务。复制配置模板，然后在 `.env` 中填写该服务的连接信息：
+
+```bash
+cp .env.example .env
+```
+
+`.env` 配置示例：
 
 ```dotenv
 DB_HOST="127.0.0.1"
@@ -47,7 +52,7 @@ uv run scripts/init_db.py
 
 ### 2. 首次生成
 
-在 `src/settings.py` 的 `GENERATION_CONFIG` 中配置规模，然后指定起止月份：
+在 `src/settings.py` 的 `GENERATION_CONFIG` 中配置规模。首次生成需要同时指定 `--start-month` 和 `--end-month`，分别表示开始月份和截止月份：
 
 ```bash
 uv run main.py --start-month 2026-01 --end-month 2026-08
@@ -55,13 +60,15 @@ uv run main.py --start-month 2026-01 --end-month 2026-08
 
 ### 3. 追加或补充当月
 
+追加时只传 `--end-month`，不再指定开始月份。程序读取已有进度，自动补完未完成的月份，再连续生成到指定的截止月份。
+
 ```bash
 uv run main.py --end-month 2026-09
 ```
 
-追加时不要再次初始化数据库。需要小规模验证时，在生成命令后加 `--smoke`，日期范围不变，规模缩放到 5%。
+例如，已有数据完整生成到 8 月，上面的命令会从 9 月开始生成。如果 9 月已生成过一部分，再执行同一命令会补充到本次任务启动时刻。截止月份不能超过当前月份；历史月份生成整月，当月只生成截至任务启动时刻的数据。已完整生成的月份不能重复生成，已有数据会保留。
 
-本地进度保存在 `.generation-status.json`，包含起始月份、最新已提交截止时间 `cutoff`、已完成月份、当前月份、smoke 模式和待恢复标记 `needs_recovery`。生成进度提交及回滚时自动更新；时间使用北京时间。若运行中断且 `needs_recovery` 为 `true`，需再次执行生成命令完成恢复。该文件仅供查看，追加以数据库记录为准。
+追加时不要再次初始化数据库。需要小规模验证时，在生成命令后加 `--smoke`，日期范围不变，规模缩放到 5%。
 
 ## 数仓模型
 

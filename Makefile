@@ -1,14 +1,14 @@
-MONTH_ARGS = $(if $(start_month),--start-month $(start_month)) $(if $(end_month),--end-month $(end_month))
+MONTH_ARGS = $(if $(start),--start-month $(start)) $(if $(end),--end-month $(end))
 
 .PHONY: help init-db generate smoke clean
 
 help:
-	@echo "make init-db                                        - 重建Doris业务数据库并创建表"
-	@echo "make generate start_month=2026-01 end_month=2026-08 - 首次生成"
-	@echo "make generate end_month=2026-09                     - 追加数据"
-	@echo "make smoke start_month=2026-01 end_month=2026-08    - 首次生成，使用 5% 数据规模"
-	@echo "make smoke end_month=2026-09                        - 追加 smoke 数据"
-	@echo "make clean                                          - 清理临时文件"
+	@echo "make init-db                            - 重建Doris业务数据库并创建表"
+	@echo "make generate start=2026-01 end=2026-08 - 首次生成"
+	@echo "make generate end=2026-09               - 追加数据"
+	@echo "make smoke start=2026-01 end=2026-08    - 首次生成，使用 5% 数据规模"
+	@echo "make smoke end=2026-09                  - 追加 smoke 数据"
+	@echo "make clean                              - 清理临时文件"
 
 init-db:
 	uv run scripts/init_db.py

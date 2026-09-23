@@ -73,9 +73,8 @@ def build_plan(
         commerce.generate_day(ctx, refs, state, writer, day, batch_id, intents)
         day += timedelta(days=1)
     logger.info(
-        "month=%s 业务事件生成完成 planned_through=%s pending_facts=%s elapsed=%.2fs",
+        "month=%s 业务事件生成完成 pending_facts=%s elapsed=%.2fs",
         month_label,
-        period.end_date,
         len(state.pending_facts),
         perf_counter() - started,
     )
@@ -84,23 +83,17 @@ def build_plan(
     )
     writer.flush_all()
     logger.info(
-        "month=%s 月度数据生成完成 planned_rows=%s elapsed=%.2fs",
+        "month=%s 月度数据生成完成 rows=%s elapsed=%.2fs",
         month_label,
         sum(len(rows) for rows in store.journal.values()),
         perf_counter() - started,
     )
-    state_started = perf_counter()
     # 只需保留未来库存事件的序号；已经结束的月份不会再分配事件 ID。
     state.inventory_event_sequences = {
         day: count
         for day, count in state.inventory_event_sequences.items()
         if day > ctx.gen.end_date
     }
-    logger.info(
-        "month=%s 月末状态整理完成 elapsed=%.2fs",
-        month_label,
-        perf_counter() - state_started,
-    )
     return {
         "before_dimensions": before_dimensions,
         "journal": dict(store.journal),

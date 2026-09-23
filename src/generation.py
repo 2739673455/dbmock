@@ -83,11 +83,9 @@ def publish(ctx, guard, plan, old_cutoff, cutoff):
         for future in futures:
             future.result()
     logger.info(
-        "month=%s 月度数据写入完成 tables=%s written_rows=%s cutoff=%s elapsed=%.2fs",
+        "month=%s 月度数据写入完成 rows=%s elapsed=%.2fs",
         month_label,
-        len(futures),
         row_count,
-        cutoff,
         perf_counter() - started,
     )
     ctx.validation_cutoff = cutoff
@@ -200,16 +198,18 @@ def run(ctx, args, guard):
     while month <= args.end_month:
         month_started = perf_counter()
         logger.info(
-            "month=%s 月份生成开始 mode=%s previous_cutoff=%s",
+            "month=%s 月份生成开始 mode=%s",
             month.strftime("%Y-%m"),
             "smoke" if dataset["smoke"] else "full",
-            dataset["cutoff"],
         )
         guard()
         check_seeds(dataset["seeds"], seed_fingerprints())
+        cutoff = min(ctx.as_of_time, datetime.combine(month_end(month), time.max))
+        complete = cutoff == datetime.combine(month_end(month), time.max)
         key = f"plan:{month:%Y-%m}"
         plan = store.get(key)
-        if plan is None:
+        new_plan = plan is None
+        if new_plan:
             config = read_config()
             initial = (
                 store.get(f"plan:{dataset['start']:%Y-%m}")
@@ -222,15 +222,25 @@ def run(ctx, args, guard):
             logger.info(
                 "month=%s 月度规模抽样完成 scales=%s", month.strftime("%Y-%m"), scales
             )
-            plan = {"month": month, "config": config, "scales": scales}
-            _configure(ctx, dataset, plan)
-            if dataset["checkpoint"]:
+            plan = {
+                "month": month,
+                "config": config,
+                "scales": scales,
+                "before_checkpoint": dataset["checkpoint"],
+                "before_counts": dict(dataset["counts"]),
+                "before_cutoff": dataset["cutoff"],
+            }
+        _configure(ctx, dataset, plan)
+        if "journal" not in plan:
+            if plan["before_checkpoint"]:
                 restore_started = perf_counter()
-                baseline = store.get(dataset["checkpoint"])
+                baseline = store.get(plan["before_checkpoint"])
+                if baseline is None:
+                    raise ValueError("缺少月初检查点，无法恢复或重新生成该月数据")
                 logger.info(
                     "month=%s 上月状态恢复完成 checkpoint=%s elapsed=%.2fs",
                     month.strftime("%Y-%m"),
-                    dataset["checkpoint"],
+                    plan["before_checkpoint"],
                     perf_counter() - restore_started,
                 )
             else:
@@ -238,46 +248,74 @@ def run(ctx, args, guard):
                 logger.info("month=%s 首次生成，无上月检查点", month.strftime("%Y-%m"))
             before_dimensions = baseline["dimensions"] if baseline else {}
             before_state = baseline["state"] if baseline else BusinessState()
-            # 计划先在内存中完成业务约束校验，再冻结并发布。
-            plan.update(
-                before_dimensions=before_dimensions,
-                before_counts=dict(dataset["counts"]),
-                before_cutoff=dataset["cutoff"],
-            )
-            plan.update(build_plan(ctx, before_dimensions, before_state))
-            save_started = perf_counter()
-            store.put("dataset", dataset)
-            dataset_seconds = perf_counter() - save_started
-            saved = store.put(key, plan)
-            logger.info(
-                "month=%s 月度数据已暂存 compressed_bytes=%s chunks=%s "
-                "dataset_save=%.2fs serialize=%.2fs type_convert=%.2fs "
-                "json_encode=%.2fs serialize_release=%.2fs compress=%.2fs "
-                "encode=%.2fs write=%.2fs cleanup=%.2fs elapsed=%.2fs",
-                month.strftime("%Y-%m"),
-                saved["compressed_bytes"],
-                saved["chunks"],
-                dataset_seconds,
-                saved["serialize_seconds"],
-                saved["type_convert_seconds"],
-                saved["json_encode_seconds"],
-                saved["serialize_release_seconds"],
-                saved["compress_seconds"],
-                saved["encode_seconds"],
-                saved["write_seconds"],
-                saved["cleanup_seconds"],
-                perf_counter() - save_started,
-            )
+            plan["before_dimensions"] = before_dimensions
+            if dataset["dirty"]:
+                rollback(ctx, store, dataset, plan)
+            if not new_plan:
+                logger.info(
+                    "month=%s 按冻结配置重新生成数据 scales=%s",
+                    month.strftime("%Y-%m"),
+                    plan["scales"],
+                )
+            generated = build_plan(ctx, before_dimensions, before_state)
+            if not new_plan and generated["selections"] != plan["selections"]:
+                raise ValueError("重新生成的商品上架安排与冻结记录不一致，拒绝写入")
+            plan.update(generated)
+            # 先完成生成约束检查，再冻结配置；完整月份不保存整月明细。
+            if new_plan or not complete:
+                save_started = perf_counter()
+                store.put("dataset", dataset)
+                dataset_seconds = perf_counter() - save_started
+                if complete:
+                    store.put(
+                        key,
+                        {
+                            name: plan[name]
+                            for name in (
+                                "month",
+                                "config",
+                                "scales",
+                                "selections",
+                                "before_checkpoint",
+                                "before_counts",
+                                "before_cutoff",
+                            )
+                        },
+                    )
+                    logger.info(
+                        "month=%s 月度恢复信息就绪 elapsed=%.2fs",
+                        month.strftime("%Y-%m"),
+                        perf_counter() - save_started,
+                    )
+                else:
+                    saved = store.put(key, plan)
+                    logger.info(
+                        "month=%s 月度数据已暂存 compressed_bytes=%s chunks=%s "
+                        "dataset_save=%.2fs serialize=%.2fs type_convert=%.2fs "
+                        "json_encode=%.2fs serialize_release=%.2fs compress=%.2fs "
+                        "encode=%.2fs write=%.2fs cleanup=%.2fs elapsed=%.2fs",
+                        month.strftime("%Y-%m"),
+                        saved["compressed_bytes"],
+                        saved["chunks"],
+                        dataset_seconds,
+                        saved["serialize_seconds"],
+                        saved["type_convert_seconds"],
+                        saved["json_encode_seconds"],
+                        saved["serialize_release_seconds"],
+                        saved["compress_seconds"],
+                        saved["encode_seconds"],
+                        saved["write_seconds"],
+                        saved["cleanup_seconds"],
+                        perf_counter() - save_started,
+                    )
         else:
             logger.info(
                 "month=%s 沿用已暂存月度数据 scales=%s",
                 month.strftime("%Y-%m"),
                 plan["scales"],
             )
-        _configure(ctx, dataset, plan)
-        cutoff = min(ctx.as_of_time, datetime.combine(month_end(month), time.max))
-        if dataset["dirty"]:
-            rollback(ctx, store, dataset, plan)
+            if dataset["dirty"]:
+                rollback(ctx, store, dataset, plan)
         old_cutoff = (
             dataset["cutoff"]
             if dataset["cutoff"] and dataset["cutoff"].date().replace(day=1) == month
@@ -285,9 +323,8 @@ def run(ctx, args, guard):
         )
         if old_cutoff is not None and cutoff <= old_cutoff:
             logger.info(
-                "month=%s 截止时刻未推进，没有新增数据 cutoff=%s",
+                "month=%s 截止时刻未推进，没有新增数据",
                 month.strftime("%Y-%m"),
-                cutoff,
             )
             return
         seed_started = perf_counter()
@@ -303,7 +340,6 @@ def run(ctx, args, guard):
         try:
             ctx.expected_counts = publish(ctx, guard, plan, old_cutoff, cutoff)
             quality.validate_database(ctx, tables)
-            complete = cutoff == datetime.combine(month_end(month), time.max)
             checkpoint_key = f"checkpoint:{month:%Y-%m}"
             if complete:
                 store.put(

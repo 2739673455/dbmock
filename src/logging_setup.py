@@ -13,6 +13,21 @@ from rich.text import Text
 
 
 class ConsoleLogHandler(RichHandler):
+    MONTH_COLORS = (
+        "#56B4E9",  # 天蓝
+        "#E69F00",  # 橙黄
+        "#66CC99",  # 薄荷绿
+        "#CC79A7",  # 紫红
+        "#F0E442",  # 明黄
+        "#9999FF",  # 淡紫
+        "#FF8877",  # 珊瑚红
+        "#44CCCC",  # 青绿
+        "#DD99EE",  # 浅紫红
+        "#AADD66",  # 黄绿
+        "#FFBB88",  # 杏色
+        "#88AAEE",  # 蓝紫
+    )
+
     def render(self, *, record, traceback, message_renderable):
         month = ""
         if isinstance(message_renderable, Text) and message_renderable.plain.startswith(
@@ -22,15 +37,20 @@ class ConsoleLogHandler(RichHandler):
             if separator:
                 month = prefix.removeprefix("month=")
                 message_renderable = message_renderable[len(prefix) + 1 :]
+        month_style = "bold"
+        if month:
+            month_date = datetime.strptime(month, "%Y-%m")
+            color_index = month_date.year * 12 + month_date.month - 1
+            month_style += " " + self.MONTH_COLORS[color_index % len(self.MONTH_COLORS)]
         output = Table.grid(padding=(0, 1), expand=True)
         output.add_column(style="log.time", no_wrap=True)
         output.add_column(no_wrap=True)
-        output.add_column(style="bold cyan", no_wrap=True)
+        output.add_column(no_wrap=True)
         output.add_column(ratio=1, overflow="fold")
         output.add_row(
             datetime.fromtimestamp(record.created).strftime("%H:%M:%S"),
             Text(record.levelname, style=f"logging.level.{record.levelname.lower()}"),
-            month,
+            Text(month, style=month_style),
             Group(message_renderable, traceback) if traceback else message_renderable,
         )
         return output
