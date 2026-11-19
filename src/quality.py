@@ -13,7 +13,6 @@ from collections.abc import Mapping
 from sqlalchemy import Table, text
 
 from .settings import RunContext
-from .support import doris_unique_key_columns
 from .plan_store import FACT_TIME_COLUMNS
 
 logger = logging.getLogger(__name__)
@@ -56,7 +55,7 @@ CHECKS: dict[str, str] = {
     "日期节假日配置": """
         SELECT
             CASE
-                WHEN DATEDIFF(MAX(full_date), MIN(full_date)) >= 365
+                WHEN (MAX(full_date) - MIN(full_date)) >= 365
                  AND SUM(is_holiday) = 0
                 THEN 1
                 ELSE 0
@@ -145,15 +144,15 @@ CHECKS: dict[str, str] = {
         SELECT SUM(violations) FROM (
             SELECT COUNT(*) violations FROM dwd_trade_order_detail_di
              WHERE biz_date <> DATE(order_create_time)
-                OR order_date_key <> DATE_FORMAT(order_create_time, '%Y%m%d') + 0
+                OR order_date_key <> CAST(TO_CHAR(order_create_time, 'YYYYMMDD') AS INTEGER)
             UNION ALL
             SELECT COUNT(*) FROM dwd_trade_pay_detail_di
              WHERE biz_date <> DATE(pay_request_time)
-                OR pay_date_key <> DATE_FORMAT(pay_request_time, '%Y%m%d') + 0
+                OR pay_date_key <> CAST(TO_CHAR(pay_request_time, 'YYYYMMDD') AS INTEGER)
             UNION ALL
             SELECT COUNT(*) FROM dwd_inventory_change_di
              WHERE biz_date <> DATE(event_time)
-                OR event_date_key <> DATE_FORMAT(event_time, '%Y%m%d') + 0
+                OR event_date_key <> CAST(TO_CHAR(event_time, 'YYYYMMDD') AS INTEGER)
         ) q
     """,
     "业务状态时间严格递增": """
@@ -260,9 +259,9 @@ CHECKS: dict[str, str] = {
                 OR previous_cost_price IS NOT NULL
               ))
            OR (row_no > 1 AND (
-                   NOT (previous_list_price <=> last_list_price)
-                OR NOT (previous_sale_price <=> last_sale_price)
-                OR NOT (previous_cost_price <=> last_cost_price)
+                   previous_list_price IS DISTINCT FROM last_list_price
+                OR previous_sale_price IS DISTINCT FROM last_sale_price
+                OR previous_cost_price IS DISTINCT FROM last_cost_price
               ))
     """,
     "退款不超过实付": """
@@ -341,7 +340,7 @@ CHECKS: dict[str, str] = {
            OR s.in_transit_qty <> e.last_in_transit
     """,
     "库存快照覆盖范围": """
-        -- 快照 UNIQUE KEY 为 (snapshot_date_key, warehouse_sk, sku_sk)。
+        -- 快照主键为 (snapshot_date_key, warehouse_sk, sku_sk)。
         -- 缺失数 = 应有数 - 合法数；多余数单独累计，避免相互抵消。
         WITH listings AS (
             SELECT warehouse_sk, sku_sk, MIN(biz_date) listing_date
@@ -433,7 +432,7 @@ CHECKS: dict[str, str] = {
         ) shipped ON shipped.delivery_id = i.delivery_id
         LEFT JOIN dwd_inventory_change_di c
           ON c.biz_type = 'DELIVERY'
-         AND c.biz_id = CAST(i.order_id AS STRING)
+         AND c.biz_id = CAST(i.order_id AS TEXT)
          AND c.sku_id = i.sku_id
         WHERE d.delivery_direction = '正向'
           AND (c.inventory_change_id IS NULL OR c.warehouse_id <> d.warehouse_id)
@@ -509,15 +508,15 @@ CHECKS: dict[str, str] = {
             WHERE row_no = 1
         ), inventory_evidence AS (
             SELECT biz_id,
-                   SUM(change_type = 'ALLOCATION_FAILED') failed_count,
-                   SUM(change_type = 'SALE_RESERVE') reserve_count
+                   COUNT(*) FILTER (WHERE change_type = 'ALLOCATION_FAILED') failed_count,
+                   COUNT(*) FILTER (WHERE change_type = 'SALE_RESERVE') reserve_count
             FROM dwd_inventory_change_di
             WHERE biz_type = 'ORDER'
             GROUP BY biz_id
         )
         SELECT COUNT(*)
         FROM latest_status s
-        LEFT JOIN inventory_evidence i ON i.biz_id = CAST(s.order_id AS STRING)
+        LEFT JOIN inventory_evidence i ON i.biz_id = CAST(s.order_id AS TEXT)
         WHERE s.after_order_status = 'CANCELLED'
           AND s.status_reason_code = 'OUT_OF_STOCK'
           AND (COALESCE(i.failed_count, 0) = 0 OR COALESCE(i.reserve_count, 0) > 0)
@@ -577,17 +576,14 @@ CHECKS: dict[str, str] = {
           AND u.is_current = 1
           AND u.effective_start_time <= :lifecycle_cutoff
           AND (
-              (u.user_status IN ('正常', '召回') AND DATEDIFF(
-                   c.cutoff_date,
-                   DATE(COALESCE(a.last_active_time, u.register_time))
+              (u.user_status IN ('正常', '召回') AND (
+                   c.cutoff_date - DATE(COALESCE(a.last_active_time, u.register_time))
               ) >= 90)
-              OR (u.user_status = '沉默' AND DATEDIFF(
-                   c.cutoff_date,
-                   DATE(COALESCE(a.last_active_time, u.register_time))
+              OR (u.user_status = '沉默' AND (
+                   c.cutoff_date - DATE(COALESCE(a.last_active_time, u.register_time))
               ) < 60)
-              OR (u.user_status = '流失' AND DATEDIFF(
-                   c.cutoff_date,
-                   DATE(COALESCE(a.last_active_time, u.register_time))
+              OR (u.user_status = '流失' AND (
+                   c.cutoff_date - DATE(COALESCE(a.last_active_time, u.register_time))
               ) < 180)
           )
     """,
@@ -725,7 +721,7 @@ def validate_database(ctx: RunContext, tables: Mapping[str, Table]) -> None:
         for table_name in sorted(tables):
             table = tables[table_name]
             count = int(
-                conn.execute(text(f"SELECT COUNT(*) FROM `{table_name}`")).scalar_one()
+                conn.execute(text(f'SELECT COUNT(*) FROM "{table_name}"')).scalar_one()
             )
             counts[table_name] = count
             if count == 0 or "dw_load_time" not in table.c:
@@ -733,7 +729,7 @@ def validate_database(ctx: RunContext, tables: Mapping[str, Table]) -> None:
             load_range = conn.execute(
                 text(
                     f"SELECT MIN(dw_load_time), MAX(dw_load_time), "
-                    f"SUM(dw_load_time > :as_of_time) FROM `{table_name}`"
+                    f'COUNT(*) FILTER (WHERE dw_load_time > :as_of_time) FROM "{table_name}"'
                 ),
                 {"as_of_time": ctx.validation_cutoff or ctx.as_of_time},
             ).one()
@@ -748,7 +744,7 @@ def validate_database(ctx: RunContext, tables: Mapping[str, Table]) -> None:
                 before_business_date = int(
                     conn.execute(
                         text(
-                            f"SELECT COUNT(*) FROM `{table_name}` "
+                            f'SELECT COUNT(*) FROM "{table_name}" '
                             "WHERE DATE(dw_load_time) < biz_date"
                         )
                     ).scalar_one()
@@ -760,9 +756,9 @@ def validate_database(ctx: RunContext, tables: Mapping[str, Table]) -> None:
                 batch_month_mismatch = int(
                     conn.execute(
                         text(
-                            f"SELECT COUNT(*) FROM `{table_name}` "
+                            f'SELECT COUNT(*) FROM "{table_name}" '
                             "WHERE RIGHT(load_batch_id, 7) "
-                            "<> DATE_FORMAT(biz_date, '%Y-%m')"
+                            "<> TO_CHAR(biz_date, 'YYYY-MM')"
                         )
                     ).scalar_one()
                 )
@@ -779,10 +775,10 @@ def validate_database(ctx: RunContext, tables: Mapping[str, Table]) -> None:
             if fact_time_column is not None:
                 invalid_fact_time = conn.execute(
                     text(
-                        f"SELECT SUM(`{fact_time_column}` > :as_of_time), "
-                        f"SUM(dw_load_time < `{fact_time_column}`), "
-                        f"SUM(DATE(`{fact_time_column}`) <> biz_date) "
-                        f"FROM `{table_name}`"
+                        f'SELECT COUNT(*) FILTER (WHERE "{fact_time_column}" > :as_of_time), '
+                        f'COUNT(*) FILTER (WHERE dw_load_time < "{fact_time_column}"), '
+                        f'COUNT(*) FILTER (WHERE DATE("{fact_time_column}") <> biz_date) '
+                        f'FROM "{table_name}"'
                     ),
                     {"as_of_time": ctx.validation_cutoff or ctx.as_of_time},
                 ).one()
@@ -802,9 +798,9 @@ def validate_database(ctx: RunContext, tables: Mapping[str, Table]) -> None:
                 invalid_source_time = int(
                     conn.execute(
                         text(
-                            f"SELECT COUNT(*) FROM `{table_name}` "
+                            f'SELECT COUNT(*) FROM "{table_name}" '
                             "WHERE source_update_time IS NULL "
-                            f"OR source_update_time > `{warehouse_time_column}`"
+                            f'OR source_update_time > "{warehouse_time_column}"'
                         )
                     ).scalar_one()
                 )
@@ -831,7 +827,7 @@ def validate_database(ctx: RunContext, tables: Mapping[str, Table]) -> None:
                 failures.append(f"{name}: {violations} 条")
         failures.extend(_generation_completeness_failures(ctx, conn, counts))
         for table_name, business_keys in SCD_TABLES.items():
-            partition = ", ".join(f"`{key}`" for key in business_keys)
+            partition = ", ".join(f'"{key}"' for key in business_keys)
             overlap_sql = f"""
                 SELECT COUNT(*) FROM (
                     SELECT effective_start_time,
@@ -839,7 +835,7 @@ def validate_database(ctx: RunContext, tables: Mapping[str, Table]) -> None:
                                PARTITION BY {partition}
                                ORDER BY effective_start_time
                            ) previous_end
-                    FROM `{table_name}`
+                    FROM "{table_name}"
                 ) x
                 WHERE previous_end > effective_start_time
             """
@@ -849,7 +845,7 @@ def validate_database(ctx: RunContext, tables: Mapping[str, Table]) -> None:
             current_sql = f"""
                 SELECT COUNT(*) FROM (
                     SELECT {partition}
-                    FROM `{table_name}`
+                    FROM "{table_name}"
                     GROUP BY {partition}
                     HAVING SUM(is_current) <> 1
                 ) x
@@ -858,7 +854,7 @@ def validate_database(ctx: RunContext, tables: Mapping[str, Table]) -> None:
             if invalid_current:
                 failures.append(f"{table_name} 当前版本数量异常: {invalid_current} 条")
         for table_name, business_keys in RELATION_SCD_TABLES.items():
-            partition = ", ".join(f"`{key}`" for key in business_keys)
+            partition = ", ".join(f'"{key}"' for key in business_keys)
             invalid_relations = int(
                 conn.execute(
                     text(
@@ -869,7 +865,7 @@ def validate_database(ctx: RunContext, tables: Mapping[str, Table]) -> None:
                                        PARTITION BY {partition}
                                        ORDER BY effective_start_time
                                    ) previous_end
-                            FROM `{table_name}`
+                            FROM "{table_name}"
                         ) x
                         WHERE previous_end > effective_start_time
                         """
@@ -883,7 +879,7 @@ def validate_database(ctx: RunContext, tables: Mapping[str, Table]) -> None:
                         f"""
                         SELECT COUNT(*) FROM (
                             SELECT {partition}
-                            FROM `{table_name}`
+                            FROM "{table_name}"
                             GROUP BY {partition}
                             HAVING SUM(is_current) > 1
                         ) x
@@ -897,16 +893,16 @@ def validate_database(ctx: RunContext, tables: Mapping[str, Table]) -> None:
             if multiple_current:
                 failures.append(f"{table_name} 当前关系重复: {multiple_current} 条")
         for table_name in UNKNOWN_MEMBER_TABLES:
-            unique_key_columns = doris_unique_key_columns(conn, table_name)
-            if not unique_key_columns:
-                failures.append(f"{table_name} 未定义Doris UNIQUE KEY")
+            primary_key_columns = list(tables[table_name].primary_key.columns.keys())
+            if not primary_key_columns:
+                failures.append(f"{table_name} 未定义主键")
                 continue
-            primary_key = unique_key_columns[0]
+            primary_key = primary_key_columns[0]
             unknown_count = int(
                 conn.execute(
                     text(
-                        f"SELECT COUNT(*) FROM `{table_name}` "
-                        f"WHERE `{primary_key}` = -1"
+                        f'SELECT COUNT(*) FROM "{table_name}" '
+                        f'WHERE "{primary_key}" = -1'
                     )
                 ).scalar_one()
             )

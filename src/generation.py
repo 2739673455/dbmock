@@ -69,7 +69,7 @@ def publish(ctx, guard, plan, old_cutoff, cutoff):
     visible = store.visible(cutoff)
     previous = store.visible(old_cutoff) if old_cutoff is not None else {}
     with ThreadPoolExecutor(
-        max_workers=ctx.gen.stream_load_workers, thread_name_prefix="dbmock-publish"
+        max_workers=ctx.gen.publish_workers, thread_name_prefix="dbmock-publish"
     ) as executor:
         futures = []
         for table, keys in table_keys().items():
@@ -104,16 +104,16 @@ def rollback(ctx, store, dataset, plan):
     store.wait_for_loads()
     for table in table_keys():
         store.guard()
-        with ctx.engine.connect() as conn:
+        with ctx.write_transaction() as conn:
             if table.startswith("dwd_"):
                 conn.execute(
                     text(
-                        f"DELETE FROM `{table}` WHERE biz_date >= :start AND biz_date <= :end"
+                        f"DELETE FROM {table} WHERE biz_date >= :start AND biz_date <= :end"
                     ),
                     {"start": month, "end": month_end(month)},
                 )
             else:
-                conn.execute(text(f"TRUNCATE TABLE `{table}`"))
+                conn.execute(text(f"TRUNCATE TABLE {table}"))
         if not table.startswith("dwd_"):
             _load_rows(
                 ctx, store.guard, table, plan["before_dimensions"].get(table, [])

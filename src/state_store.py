@@ -1,4 +1,4 @@
-"""Doris 中的月度状态文档与跨进程生成互斥。"""
+"""PostgreSQL 中的月度状态文档与跨进程生成互斥。"""
 
 from __future__ import annotations
 
@@ -9,13 +9,13 @@ import logging
 import threading
 import time
 import zlib
+from contextlib import contextmanager
 from pathlib import Path
 from uuid import uuid4
 from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
-from sqlalchemy.exc import DBAPIError
 
 from . import serialization
 from .settings import DATA_DIR, ROOT_DIR, now
@@ -132,27 +132,8 @@ class StateStore:
             raise ValueError(f"内部状态文档校验失败: {key}")
         return serialization.loads(zlib.decompress(compressed))
 
-    def wait_for_loads(self, timeout: float = 60) -> None:
-        """回滚前等待可能已提交但尚未可见的装载，超时则保留待恢复状态。"""
-        deadline = time.monotonic() + timeout
-        while True:
-            self.guard()
-            with self.ctx.engine.connect() as conn:
-                databases = conn.execute(text("SHOW PROC '/transactions'")).mappings()
-                database = next(
-                    (row for row in databases if row["DbName"] == self.ctx.db.database),
-                    None,
-                )
-                if database is None:
-                    raise RuntimeError("无法确认目标数据库的事务状态，拒绝回滚")
-                if int(database["RunningTransactionNum"]) == 0:
-                    return
-            if time.monotonic() >= deadline:
-                raise RuntimeError(
-                    "仍有未结束的装载事务，暂停回滚；事务结束后重新运行生成命令"
-                )
-            logger.warning("等待目标数据库的装载事务结束后再回滚")
-            time.sleep(1)
+    def wait_for_loads(self) -> None:
+        self.ctx.lock.drain()
 
     def put(self, key: str, value) -> dict[str, int | float]:
         """保存状态文档，返回大小、分块数和各阶段耗时。"""
@@ -185,26 +166,16 @@ class StateStore:
         ]
         encoded_at = time.perf_counter()
         self.guard()
-        # 一个 Stream Load 事务提交整份文档；旧版本多余分块由 revision 排除。
-        self.ctx.loader.load("dbmock_documents", rows)
+        # Replace every chunk (including stale tail chunks) in one transaction.
+        with self.ctx.write_transaction() as conn:
+            conn.execute(
+                text("DELETE FROM dbmock_documents WHERE document_key = :key"),
+                {"key": key},
+            )
+            self.ctx.loader.load_in(conn, "dbmock_documents", rows)
         written_at = time.perf_counter()
         if key == "dataset":
             write_status(self.ctx, value)
-        try:
-            self.guard()
-            with self.ctx.engine.connect() as conn:
-                conn.execute(
-                    text(
-                        "DELETE FROM dbmock_documents WHERE document_key = :key AND revision != :revision"
-                    ),
-                    {"key": key, "revision": revision},
-                )
-        except Exception:
-            logger.warning(
-                "旧状态分块清理失败，已提交的新状态仍有效 document=%s",
-                key,
-                exc_info=True,
-            )
 
         return {
             "compressed_bytes": len(compressed),
@@ -221,124 +192,81 @@ class StateStore:
 
 
 class GenerationLock:
-    """原子建表抢占；连接失效后以保留的重命名墓碑防止并发回收旧锁。"""
+    """One coordinator per database; fence every independent writer transaction.
+
+    Session lock (DBMK,1) identifies the live coordinator. Shared transaction
+    locks (DBMK,2) cover every write through COMMIT; the exclusive barrier drains
+    even an orphan backend whose client didn't receive the commit response.
+    """
+
+    _OWNER = text("""
+        SELECT EXISTS (
+          SELECT 1 FROM pg_catalog.pg_locks l
+          JOIN pg_catalog.pg_stat_activity a ON a.pid = l.pid
+          WHERE l.locktype = 'advisory' AND l.granted AND l.mode = 'ExclusiveLock'
+            AND l.database = (SELECT oid FROM pg_catalog.pg_database
+                               WHERE datname = current_database())
+            AND l.classid = 1145195851 AND l.objid = 1 AND l.objsubid = 2
+            AND a.pid = :pid AND a.backend_start = :started
+        )
+    """)
 
     def __init__(self, engine):
         self.engine = engine
-        self.conn: Connection
+        self.conn: Connection | None = None
         self.owner: dict = {}
         self._mutex = threading.Lock()
-        self._stop = threading.Event()
-        self._lost = None
-        self._thread = None
-
-    def _comment(self):
-        value = self.conn.execute(
-            text(
-                "SELECT TABLE_COMMENT FROM information_schema.tables WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'dbmock_run_lock'"
-            )
-        ).scalar_one_or_none()
-        return json.loads(value) if value else None
-
-    def _sessions(self):
-        return (
-            self.conn.execute(
-                text(
-                    "SELECT Id, Host, LoginTime, FE FROM information_schema.processlist"
-                )
-            )
-            .mappings()
-            .all()
-        )
-
-    @staticmethod
-    def _identity(row):
-        return {key: str(row.get(key, "")) for key in ("Id", "Host", "LoginTime", "FE")}
 
     def __enter__(self):
-        self.conn = self.engine.connect()
+        conn = self.engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+        # Session advisory locks must never go back to the general pool.
+        conn.detach()
+        self.conn = conn
         try:
-            current = next(
-                row
-                for row in self.conn.execute(text("SHOW FULL PROCESSLIST")).mappings()
-                if row["CurrentConnected"] == "Yes"
+            if not conn.scalar(text("SELECT pg_try_advisory_lock(1145195851, 1)")):
+                raise ValueError("该数据库已有生成或校验任务运行，拒绝并发执行")
+            self.owner = dict(
+                conn.execute(
+                    text("""
+                SELECT pid, backend_start AS started FROM pg_catalog.pg_stat_activity
+                WHERE pid = pg_backend_pid()
+            """)
+                )
+                .mappings()
+                .one()
             )
-            self.owner = self._identity(current) | {"token": uuid4().hex}
-            for attempt in range(5):
-                try:
-                    self.conn.execute(
-                        text(
-                            "CREATE TABLE dbmock_run_lock (lock_id INT NOT NULL) ENGINE=OLAP DUPLICATE KEY(lock_id) COMMENT :owner DISTRIBUTED BY HASH(lock_id) BUCKETS 1 PROPERTIES ('replication_num'='1')"
-                        ),
-                        {"owner": json.dumps(self.owner)},
-                    )
-                    break
-                except DBAPIError:
-                    previous = self._comment()
-                    if previous is None:
-                        raise
-                    identity = {
-                        key: previous[key] for key in ("Id", "Host", "LoginTime", "FE")
-                    }
-                    if any(self._identity(row) == identity for row in self._sessions()):
-                        raise ValueError(
-                            "该数据库已有生成或校验任务运行，拒绝并发执行"
-                        ) from None
-                    token = previous["token"]
-                    if len(token) != 32 or any(
-                        c not in "0123456789abcdef" for c in token
-                    ):
-                        raise ValueError("生成锁标识损坏，拒绝自动回收") from None
-                    try:
-                        # 不删除墓碑，延迟到达的竞争者无法把新锁改名为同一个旧锁墓碑。
-                        self.conn.execute(
-                            text(
-                                f"ALTER TABLE dbmock_run_lock RENAME dbmock_stale_lock_{token}"
-                            )
-                        )
-                        logger.warning("已回收中断任务的生成锁")
-                    except DBAPIError:
-                        # 其他任务已回收；重新检查当前持有者。
-                        continue
-            else:
-                raise RuntimeError("生成锁回收失败，请检查数据库权限和并发任务")
-            self._thread = threading.Thread(target=self._heartbeat, daemon=True)
-            self._thread.start()
+            self.drain()
             return self
         except BaseException:
-            self.conn.close()
+            self.__exit__(None, None, None)
             raise
 
-    def _heartbeat(self):
-        while not self._stop.wait(10):
-            try:
-                self.check()
-            except Exception as exc:
-                self._lost = exc
-                return
+    def _verify(self, conn):
+        if not self.owner or not conn.scalar(self._OWNER, self.owner):
+            raise RuntimeError("生成锁连接已失效，停止写入；下次运行将回滚未完成月份")
 
     def check(self):
-        if self._lost:
-            raise RuntimeError(
-                "生成锁连接已失效，停止写入；下次运行将回滚未完成月份"
-            ) from self._lost
         with self._mutex:
-            try:
-                self.conn.execute(text("SELECT 1"))
-                if self._comment() != self.owner:
-                    raise RuntimeError("生成锁所有者发生变化")
-            except Exception as exc:
-                self._lost = exc
-                raise
+            if self.conn is None:
+                raise RuntimeError("生成任务未持锁")
+            self._verify(self.conn)
+
+    def drain(self):
+        with self.engine.begin() as conn:
+            conn.execute(text("SET LOCAL lock_timeout = '60s'"))
+            conn.execute(text("SELECT pg_advisory_xact_lock(1145195851, 2)"))
+            self._verify(conn)
+
+    @contextmanager
+    def transaction(self):
+        with self.engine.begin() as conn:
+            conn.execute(text("SELECT pg_advisory_xact_lock_shared(1145195851, 2)"))
+            self._verify(conn)
+            yield conn
 
     def __exit__(self, *exc):
-        self._stop.set()
-        if self._thread:
-            self._thread.join()
-        try:
-            if self._lost is None:
-                with self._mutex:
-                    if self._comment() == self.owner:
-                        self.conn.execute(text("DROP TABLE dbmock_run_lock"))
-        finally:
-            self.conn.close()
+        with self._mutex:
+            self.owner = {}
+            if self.conn is not None:
+                self.conn.close()
+                self.conn = None
