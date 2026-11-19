@@ -19,9 +19,11 @@ def table_keys() -> dict[str, tuple[str, ...]]:
         Path(__file__).resolve().parents[1] / "scripts/sql/ecommerce.sql"
     ).read_text()
     return {
-        name: tuple(re.findall(r"`(\w+)`", keys))
+        name: tuple(key.strip() for key in keys.split(","))
         for name, keys in re.findall(
-            r"CREATE TABLE (\w+)\s*\(.*?UNIQUE KEY\s*\(([^)]+)\)", ddl, re.S
+            r"CREATE TABLE (\w+)\s*\((?:(?!\n\);).)*?PRIMARY KEY\s*\(([^)]+)\)",
+            ddl,
+            re.S,
         )
         if not name.startswith("dbmock_")
     }

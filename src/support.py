@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import warnings
 from functools import lru_cache
 from collections import defaultdict
 from collections.abc import Iterable, Iterator, Mapping
@@ -13,9 +12,8 @@ from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Protocol
 
-from sqlalchemy import MetaData, Table, select, text
+from sqlalchemy import MetaData, Table, select
 from sqlalchemy.engine import Connection, Engine
-from sqlalchemy.exc import SAWarning
 
 
 UNKNOWN_SK = -1
@@ -140,34 +138,8 @@ def fact_audit(record_id: str, batch_id: str) -> dict[str, Any]:
 
 def reflect_tables(engine: Engine) -> dict[str, Table]:
     metadata = MetaData()
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message=r"Unknown schema content:.*",
-            category=SAWarning,
-        )
-        metadata.reflect(bind=engine)
+    metadata.reflect(bind=engine)
     return dict(metadata.tables)
-
-
-def doris_unique_key_columns(
-    conn: Connection,
-    table_name: str,
-) -> list[str]:
-    rows = conn.execute(
-        text(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_schema = DATABASE()
-              AND table_name = :table_name
-              AND column_key = 'UNI'
-            ORDER BY ordinal_position
-            """
-        ),
-        {"table_name": table_name},
-    )
-    return [str(value) for value in rows.scalars()]
 
 
 def assert_empty(
@@ -180,7 +152,7 @@ def assert_empty(
             populated.append(name)
     if populated:
         names = ", ".join(sorted(populated))
-        raise ValueError(f"目标库不是空库，请先执行 make init-db: {names}")
+        raise ValueError(f"目标库不是空库，请使用新数据库或显式重置造数表: {names}")
 
 
 def build_version_index(

@@ -23,7 +23,7 @@ uv sync
 
 ### 创建本地配置
 
-本项目需要可访问的 Apache Doris 服务。复制配置模板，然后在 `.env` 中填写该服务的连接信息：
+本项目需要 **PostgreSQL 15 或更高版本**（使用 `MERGE`）。请提前创建一个专用空数据库；配置中的用户需要对其 public schema 有建表权限，并可创建临时表。复制配置模板，然后在 `.env` 中填写该服务的连接信息：
 
 ```bash
 cp .env.example .env
@@ -33,22 +33,21 @@ cp .env.example .env
 
 ```dotenv
 DB_HOST="127.0.0.1"
-DB_PORT=9030
-DB_HTTP_PORT=8040
-DB_USER="atguigu"
-DB_PASSWORD="123123"
+DB_PORT=5432
+DB_USER="dbmock"
+DB_PASSWORD="replace-me"
 DB_NAME="ecommerce"
 ```
 
 ## 快速开始
 
-### 1. 初始化 Doris
+### 1. 初始化 PostgreSQL
 
 ```bash
 uv run scripts/init_db.py
 ```
 
-该命令会删除并重建 `.env` 中 `DB_NAME` 指定的数据库，然后执行全部业务表和内部管理表 DDL。
+该命令只连接 `DB_NAME` 指定的已有数据库，在单个事务中创建 45 张业务表和 1 张管理表。public 中已有表、视图或序列时会退出；不会删除数据库，不会覆盖旧数据。首次创建数据库可用 `createdb -O dbmock ecommerce`（由管理员执行，角色须已存在）。
 
 ### 2. 首次生成
 
@@ -72,7 +71,7 @@ uv run main.py --end-month 2026-09
 
 ## 数仓模型
 
-项目在 Doris 中创建 45 张业务表，覆盖以下主题域：
+项目在 PostgreSQL 中创建 45 张业务表，覆盖以下主题域：
 
 - 公共维度：日期、渠道、页面、行政区划、支付方式和物流公司
 - 用户域：用户拉链维度、用户标签及标签关系
@@ -95,3 +94,18 @@ uv run main.py --end-month 2026-09
 - `dwd_*_df`：全量日快照表
 
 完整 DDL 位于 `scripts/sql/ecommerce.sql`
+
+## 校验和恢复
+
+`uv run main.py --validate-only` 按数据库中已提交的截止时间校验；本地进度文件不是恢复依据。程序以 COPY 写临时表，再按原逻辑键 MERGE；只更新传入字段，显式 NULL 与省略字段不同。正常补充未结束的月份只发布新增和变更行；如果检测到上次写入中断，则先回滚到该月开始前，再按已冻结的计划恢复。同一数据库同时只允许一个造数或校验任务；普通查询不需要拿生成锁。
+
+此版本只改 dbmock，不迁移已有 Doris 表或管理状态。请在新库从相同种子重新生成，不要将原数据目录当作 PostgreSQL 的数据目录。生成器显式分配代理键；不要向造数目标混入外部写入。真实内存占用随数据规模、批量大小、并发和服务配置变化。
+
+## 运行数据库集成测试
+
+在专用本地测试实例上提供允许创建数据库的账号。测试逐例创建随机命名的数据库，退出时只删除该例创建的库；未设置变量时跳过。端到端生成测试另需 `git lfs pull`。
+
+```bash
+DBMOCK_TEST_ADMIN_DSN="host=127.0.0.1 port=5432 dbname=postgres user=dbmock_test" \
+  uv run python -m unittest discover -v
+```

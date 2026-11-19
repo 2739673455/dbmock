@@ -1,122 +1,84 @@
-"""Doris数据库管理能力"""
+"""PostgreSQL 15+ COPY → staging → MERGE, one transaction per batch."""
 
 from __future__ import annotations
 
 import json
-import logging
-import re
-import threading
-from collections import defaultdict
+from functools import partial
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-import httpx
-import pyarrow as pa
-import pyarrow.parquet as pq
+from psycopg import sql
+from psycopg.types.json import Json
 
-from .settings import DorisConfig
-
-logger = logging.getLogger(__name__)
+from .plan_store import table_keys
 
 
-class DorisStreamLoader:
-    """通过严格模式Stream Load批量写入Doris"""
+_json_dump = partial(json.dumps, ensure_ascii=False, default=str, separators=(",", ":"))
 
-    def __init__(self, config: DorisConfig, batch_id: str) -> None:
-        self._config = config
-        self._batch_id = re.sub(r"[^A-Za-z0-9_-]", "_", batch_id)
-        self._sequences: defaultdict[str, int] = defaultdict(int)
-        self._client = httpx.Client(timeout=600, trust_env=False)
-        self._lock = threading.Lock()
 
-    @staticmethod
-    def _identifier(value: str) -> str:
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
-            raise ValueError(f"Doris标识符无效: {value}")
-        return value
+class PostgresLoader:
+    def __init__(self, write_transaction):
+        self.write_transaction = write_transaction
+        self.keys = table_keys() | {"dbmock_documents": ("document_key", "chunk_no")}
 
-    @classmethod
-    def _parquet_bytes(cls, rows: Sequence[Mapping[str, Any]]) -> bytes:
-        normalized = []
-        for row in rows:
-            nested = {
-                key: json.dumps(
-                    value, ensure_ascii=False, default=str, separators=(",", ":")
-                )
-                for key, value in row.items()
-                if isinstance(value, (dict, list))
-            }
-            # 普通业务行直接交给 Arrow，只有嵌套字段需要 JSON 化和行复制。
-            normalized.append(dict(row) | nested if nested else row)
-        table = pa.Table.from_pylist(normalized)
-        sink = pa.BufferOutputStream()
-        pq.write_table(
-            table,
-            sink,
-            compression="snappy",
-            use_dictionary=True,
-            write_statistics=False,
-        )
-        return sink.getvalue().to_pybytes()
+    def load(self, table: str, rows: Sequence[Mapping[str, Any]]) -> None:
+        if rows:
+            with self.write_transaction() as conn:
+                self.load_in(conn, table, rows)
 
-    def load(self, table_name: str, rows: Sequence[Mapping[str, Any]]) -> None:
+    def load_in(self, conn, table: str, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Each input has a unique plan key and one column shape. Missing ≠ NULL."""
         if not rows:
             return
-        database = self._identifier(self._config.database)
-        table = self._identifier(table_name)
-        with self._lock:
-            self._sequences[table] += 1
-            sequence = self._sequences[table]
-        label = f"{self._batch_id}_{table}_{sequence}"
-        body = self._parquet_bytes(rows)
-        headers = {
-            "Expect": "100-continue",
-            "format": "parquet",
-            "strict_mode": "true",
-            "max_filter_ratio": "0",
-            "timezone": "Asia/Shanghai",
-            "label": label,
-            "timeout": "600",
-        }
-        endpoint = (
-            f"http://{self._config.host}:{self._config.http_port}"
-            f"/api/{database}/{table}/_stream_load"
-        )
-        response = self._client.put(
-            endpoint,
-            auth=(self._config.user, self._config.password),
-            headers=headers,
-            content=body,
-        )
-        if response.is_redirect:
-            location = response.headers.get("location")
-            if not location:
-                raise RuntimeError(f"Doris Stream Load重定向缺少地址: {table}")
-            redirect_url = httpx.URL(location).copy_with(
-                username=None,
-                password=None,
+        keys = self.keys[table]
+        columns = tuple(rows[0])
+        if not set(keys).issubset(columns):
+            raise ValueError(f"Missing primary key for {table}")
+        names = sql.SQL(", ").join(map(sql.Identifier, columns))
+        target = sql.Identifier("public", table)
+        # Transaction-local staging has types, but not target defaults or NOT NULL
+        # constraints: patches to existing records need not repeat required fields.
+        stage = sql.Identifier("pg_temp", "dbmock_stage")
+        raw = conn.connection.driver_connection
+        with raw.cursor() as cur:
+            cur.execute(
+                sql.SQL(
+                    "CREATE TEMP TABLE dbmock_stage ON COMMIT DROP AS "
+                    "SELECT {} FROM {} WITH NO DATA"
+                ).format(names, target)
             )
-            response = self._client.put(
-                redirect_url,
-                auth=(self._config.user, self._config.password),
-                headers=headers,
-                content=body,
+            with cur.copy(
+                sql.SQL("COPY {} ({}) FROM STDIN").format(stage, names)
+            ) as cp:
+                for row in rows:
+                    if row.keys() != rows[0].keys():
+                        raise ValueError(f"Mixed row shapes for {table}")
+                    cp.write_row(
+                        tuple(
+                            Json(v, dumps=_json_dump)
+                            if isinstance(v, (dict, list))
+                            else v
+                            for v in (row[c] for c in columns)
+                        )
+                    )
+            equal = sql.SQL(" AND ").join(
+                sql.SQL("t.{0} = s.{0}").format(sql.Identifier(k)) for k in keys
             )
-        response.raise_for_status()
-        payload = response.json()
-        if not isinstance(payload, dict):
-            raise RuntimeError(f"Doris Stream Load响应不是对象: {table}")
-        status = str(payload.get("Status", ""))
-        total = int(payload.get("NumberTotalRows", 0))
-        loaded = int(payload.get("NumberLoadedRows", 0))
-        filtered = int(payload.get("NumberFilteredRows", 0))
-        if status != "Success" or total != len(rows) or loaded != len(rows) or filtered:
-            raise RuntimeError(
-                "Doris Stream Load失败 "
-                f"table={table} status={status} total={total} "
-                f"loaded={loaded} filtered={filtered} "
-                f"message={payload.get('Message')}"
+            updates = sql.SQL(", ").join(
+                sql.SQL("{0} = s.{0}").format(sql.Identifier(c))
+                for c in columns
+                if c not in keys
             )
-
-    def close(self) -> None:
-        self._client.close()
+            matched = (
+                sql.SQL("UPDATE SET {}").format(updates)
+                if any(c not in keys for c in columns)
+                else sql.SQL("DO NOTHING")
+            )
+            values = sql.SQL(", ").join(sql.Identifier("s", c) for c in columns)
+            cur.execute(
+                sql.SQL(
+                    "MERGE INTO {} AS t USING {} AS s ON {} "
+                    "WHEN MATCHED THEN {} "
+                    "WHEN NOT MATCHED THEN INSERT ({}) VALUES ({})"
+                ).format(target, stage, equal, matched, names, values)
+            )

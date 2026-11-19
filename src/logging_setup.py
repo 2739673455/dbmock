@@ -80,5 +80,4 @@ def configure_logging(task: str) -> Path:
         handlers=[console_handler, file_handler],
         force=True,
     )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
     return log_path

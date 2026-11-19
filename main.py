@@ -7,8 +7,7 @@ import logging
 
 from src.generation import run
 from src.logging_setup import configure_logging
-from src.settings import DorisConfig, RunContext, parse_month
-from src.state_store import GenerationLock
+from src.settings import PostgresConfig, RunContext, parse_month
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +44,9 @@ def _parse_args(argv=None):
 def main():
     args = _parse_args()
     configure_logging("validate" if args.validate_only else "generate")
-    ctx = RunContext(DorisConfig())
+    ctx = RunContext(PostgresConfig())
     try:
-        with GenerationLock(ctx.engine) as lock:
+        with ctx.lock as lock:
             run(ctx, args, lock.check)
     except BaseException:
         logger.exception("任务失败")

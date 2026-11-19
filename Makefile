@@ -3,7 +3,7 @@ MONTH_ARGS = $(if $(start),--start-month $(start)) $(if $(end),--end-month $(end
 .PHONY: help init-db generate smoke clean
 
 help:
-	@echo "make init-db                            - 重建Doris业务数据库并创建表"
+	@echo "make init-db                            - 在已有 PostgreSQL 空库中创建表"
 	@echo "make generate start=2026-01 end=2026-08 - 首次生成"
 	@echo "make generate end=2026-09               - 追加数据"
 	@echo "make smoke start=2026-01 end=2026-08    - 首次生成，使用 5% 数据规模"

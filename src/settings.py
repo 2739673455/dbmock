@@ -12,13 +12,13 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
-from uuid import uuid4
 
 import dotenv
 from sqlalchemy import URL, Engine, create_engine
 
 if TYPE_CHECKING:
-    from .database import DorisStreamLoader
+    from .database import PostgresLoader
+    from .state_store import GenerationLock
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT_DIR / "data"
@@ -40,7 +40,7 @@ GENERATION_CONFIG = {
     "variation": {"default": 0.15},  # 默认标准差为规模基准值的 15%
     "runtime": {
         "batch_size": 250000,  # 每批写入的行数上限，不参与随机抽样
-        "stream_load_workers": 4,  # Stream Load 并发线程数，不参与随机抽样
+        "publish_workers": 4,  # 并行写入线程数，不参与随机抽样
     },
 }
 SEED = 42
@@ -67,10 +67,9 @@ def next_month(month: date) -> date:
 
 
 @dataclass(slots=True)
-class DorisConfig:
+class PostgresConfig:
     host: str = field(default_factory=lambda: os.environ["DB_HOST"])
     port: int = field(default_factory=lambda: int(os.environ["DB_PORT"]))
-    http_port: int = field(default_factory=lambda: int(os.environ["DB_HTTP_PORT"]))
     user: str = field(default_factory=lambda: os.environ["DB_USER"])
     password: str = field(default_factory=lambda: os.environ["DB_PASSWORD"])
     database: str = field(default_factory=lambda: os.environ["DB_NAME"])
@@ -78,7 +77,7 @@ class DorisConfig:
     @property
     def sqlalchemy_url(self) -> URL:
         return URL.create(
-            "mysql+pymysql",
+            "postgresql+psycopg",
             username=self.user,
             password=self.password,
             host=self.host,
@@ -143,7 +142,7 @@ class GenerateConfig:
     end_date: date
     dataset_start: date
     batch_size: int
-    stream_load_workers: int
+    publish_workers: int
     user_count: int
     initial_user_count: int
     spu_count: int
@@ -187,23 +186,29 @@ class GenerateConfig:
 
 @dataclass(slots=True)
 class RunContext:
-    db: DorisConfig
+    db: PostgresConfig
     gen: GenerateConfig = field(init=False)
     as_of_time: datetime = field(default_factory=now)
-    execution_id: str = field(init=False)
+    lock: GenerationLock = field(init=False)
     engine: Engine = field(init=False)
-    loader: DorisStreamLoader = field(init=False)
+    loader: PostgresLoader = field(init=False)
     expected_counts: dict[str, int] = field(default_factory=dict)
     validation_cutoff: datetime | None = None
 
     def __post_init__(self) -> None:
-        from .database import DorisStreamLoader
+        from .database import PostgresLoader
+        from .state_store import GenerationLock
 
-        self.execution_id = f"dbmock-exec-{uuid4().hex}"
         self.engine = create_engine(
-            self.db.sqlalchemy_url, isolation_level="AUTOCOMMIT", pool_pre_ping=True
+            self.db.sqlalchemy_url,
+            pool_pre_ping=True,
+            connect_args={"options": "-c search_path=public -c timezone=Asia/Shanghai"},
         )
-        self.loader = DorisStreamLoader(self.db, self.execution_id)
+        self.lock = GenerationLock(self.engine)
+        self.loader = PostgresLoader(self.write_transaction)
+
+    def write_transaction(self):
+        return self.lock.transaction()
 
     @property
     def run_id(self) -> str:
@@ -223,5 +228,4 @@ class RunContext:
         return datetime.combine(self.gen.end_date, time.max)
 
     def close(self) -> None:
-        self.loader.close()
         self.engine.dispose()
